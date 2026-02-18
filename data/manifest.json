@@ -1,0 +1,85 @@
+{
+  "schema": 1,
+  "default": {
+    "jurisdiction": "KR",
+    "language": "ko",
+    "version_strategy": "latest",
+    "allowed_roles": [
+      "user",
+      "admin"
+    ]
+  },
+  "documents": [
+    {
+      "doc_id": "LAW-WAGE-ARREARS",
+      "doc_type": "law",
+      "title": "임금체불 실무 가이드",
+      "jurisdiction": "KR",
+      "effective_date": "2025-01-01",
+      "version": 1,
+      "path": "data/raw/law/01_wage_arrears_demo.md",
+      "allowed_roles": [
+        "user",
+        "admin"
+      ]
+    },
+    {
+      "doc_id": "LAW-WAGE-ARREARS",
+      "doc_type": "law",
+      "title": "임금체불 실무 가이드",
+      "jurisdiction": "KR",
+      "effective_date": "2026-01-01",
+      "version": 2,
+      "path": "data/raw/law/01_wage_arrears_demo_v2.md",
+      "allowed_roles": [
+        "user",
+        "admin"
+      ]
+    },
+    {
+      "doc_id": "LAW-CONTRACT-TERM",
+      "doc_type": "law",
+      "title": "계약 해제/해지 체크리스트",
+      "jurisdiction": "KR",
+      "effective_date": "2025-01-01",
+      "version": 1,
+      "path": "data/raw/law/02_contract_termination_demo.md",
+      "allowed_roles": [
+        "user",
+        "admin"
+      ]
+    },
+    {
+      "doc_id": "CASE-WAGE-ARREARS-001",
+      "doc_type": "case",
+      "title": "임금체불 분쟁 (가상 케이스)",
+      "jurisdiction": "KR",
+      "effective_date": "2025-06-01",
+      "version": 1,
+      "path": "data/raw/cases/01_case_wage_arrears_synthetic.md",
+      "allowed_roles": [
+        "user",
+        "admin"
+      ],
+      "court": "DEMO",
+      "decision_date": "2025-06-01",
+      "case_no": "DEMO-CASE"
+    },
+    {
+      "doc_id": "CASE-CONTRACT-TERM-001",
+      "doc_type": "case",
+      "title": "계약 해지 통지 분쟁 (가상 케이스)",
+      "jurisdiction": "KR",
+      "effective_date": "2025-06-01",
+      "version": 1,
+      "path": "data/raw/cases/02_case_contract_termination_synthetic.md",
+      "allowed_roles": [
+        "user",
+        "admin"
+      ],
+      "court": "DEMO",
+      "decision_date": "2025-06-01",
+      "case_no": "DEMO-CASE"
+    }
+  ]
+}
