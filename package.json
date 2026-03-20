@@ -3,16 +3,21 @@
   "version": "2.0.3",
   "private": true,
   "type": "commonjs",
-  "main": "src/server.js",
+  "main": "dist/src/server.js",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
-    "dev": "node src/server.js",
-    "ingest": "node src/cli/ingest_demo.js",
-    "reset-db": "node src/cli/reset_db.js",
-    "collect:law": "node scripts/collect_lawgo_law.js",
-    "collect:cases": "node scripts/collect_lawgo_case.js",
-    "collect:sync-manifest": "node scripts/update_manifest_from_collected.js",
+    "build": "tsc",
+    "start": "node dist/src/server.js",
+    "dev": "tsx src/server.ts",
+    "ingest": "tsx src/cli/ingest_demo.ts",
+    "reset-db": "tsx src/cli/reset_db.ts",
+    "collect:law": "tsx scripts/collect_lawgo_law.ts",
+    "collect:cases": "tsx scripts/collect_lawgo_case.ts",
+    "collect:sync-manifest": "tsx scripts/update_manifest_from_collected.ts",
     "collect:all": "npm run collect:law && npm run collect:cases && npm run collect:sync-manifest",
-    "ingest:collected": "node src/cli/ingest_collected.js"
+    "ingest:collected": "tsx src/cli/ingest_collected.ts"
   },
   "dependencies": {
     "axios": "^1.7.9",
@@ -23,8 +28,19 @@
     "express": "^4.19.2",
     "express-session": "^1.18.0",
     "morgan": "^1.10.0",
-    "nanoid": "^5.0.8",
     "p-limit": "^6.0.0",
     "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/cookie-parser": "^1.4.8",
+    "@types/express": "^4.17.21",
+    "@types/express-session": "^1.18.1",
+    "@types/morgan": "^1.9.9",
+    "@types/node": "^22.15.21",
+    "@types/yargs": "^17.0.35",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.3"
   }
 }
