@@ -12,7 +12,7 @@ from alembic.config import Config as AlembicConfig
 from app.database.postgres import connect_postgres, close_postgres
 from app.database.neo4j import connect_neo4j, close_neo4j, ensure_graph_schema
 from app.lib.redis_cache import connect_redis, close_redis
-from app.routes import health, chat, stocks, library, admin, system, quant, ml, macro, documents, notification, graph, conversations, tasks
+from app.routes import auth, health, chat, stocks, library, admin, system, quant, ml, macro, documents, notification, graph, conversations, tasks, ingest
 from app.services.graph_service import seed_graph
 from app.services.sync_scheduler import start_sync_scheduler, stop_sync_scheduler
 
@@ -64,7 +64,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 라우터 등록 (auth → auth-service Lambda, ingest → crawl-service Lambda)
+# 라우터 등록
+# auth/ingest는 프로덕션(AWS)에서 auth-service/crawl-service Lambda로도 분리 배포되지만,
+# 로컬 docker-compose 단일 앱 실행 시에도 동작하도록 메인 앱에도 등록한다.
+app.include_router(auth.router)
+app.include_router(ingest.router)
 app.include_router(health.router)
 app.include_router(chat.router)
 app.include_router(stocks.router)

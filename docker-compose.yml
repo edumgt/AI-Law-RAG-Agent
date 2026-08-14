@@ -19,6 +19,22 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:8-alpine
+    container_name: fin-ai-redis
+    ports:
+    - "16379:6379"
+    volumes:
+    - redis_data:/data
+    networks:
+    - shared-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   neo4j:
     image: neo4j:5.18-community
     container_name: fin-ai-neo4j
@@ -57,6 +73,7 @@ services:
     - shared-net
     depends_on:
     - postgres
+    - redis
     - neo4j
 
   ingest:
@@ -85,6 +102,7 @@ services:
     - shared-net
     depends_on:
     - postgres
+    - redis
 
   # ── Celery Worker (AI 에이전트·인제스트 비동기 태스크) ────────────────────────
   celery-worker:
@@ -113,6 +131,7 @@ services:
     - shared-net
     depends_on:
     - postgres
+    - redis
     - neo4j
     restart: unless-stopped
 
@@ -134,12 +153,14 @@ services:
     - shared-net
     depends_on:
     - postgres
+    - redis
     restart: unless-stopped
 
 volumes:
   app_data: null
   neo4j_data: null
   postgres_data: null
+  redis_data: null
 
 networks:
   shared-net:
