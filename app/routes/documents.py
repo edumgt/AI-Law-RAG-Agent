@@ -7,15 +7,17 @@
   POST   /api/documents/search     - 문서 전용 RAG 검색
 """
 from __future__ import annotations
-from datetime import datetime, timezone
+import uuid
 
-from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.mongo import get_mdb
+from app.database.postgres import get_pg_session
 from app.lib.session import get_current_user
 from app.lib.ollama import get_ollama
+from app.models import UploadedDoc
 from app.services.doc_parser import parse_document, SUPPORTED_EXTENSIONS
 from app.services.rag_pipeline import store_chunks, rag_search, delete_chunks_by_source
 from app.config import settings
@@ -31,7 +33,7 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 async def upload_document(
     file: UploadFile = File(...),
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     """
     문서 파일을 업로드하여 VLM으로 파싱한 뒤 Qdrant RAG에 인제스트한다.
@@ -76,21 +78,22 @@ async def upload_document(
 
     stored = await store_chunks(chunks, meta, collection=settings.DOCUMENT_COLLECTION)
 
-    doc_record = {
-        "filename":   file.filename,
-        "uploader":   user["email"],
-        "user_id":    user["id"],
-        "source_key": source_key,
-        "chunks":     stored,
-        "file_size":  len(content),
-        "ext":        ext,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    result = await mdb.uploaded_docs.insert_one(doc_record)
+    doc = UploadedDoc(
+        filename=file.filename,
+        uploader=user["email"],
+        user_id=uuid.UUID(user["id"]),
+        source_key=source_key,
+        chunks=stored,
+        file_size=len(content),
+        ext=ext,
+    )
+    db.add(doc)
+    await db.commit()
+    await db.refresh(doc)
 
     return {
         "ok":       True,
-        "doc_id":   str(result.inserted_id),
+        "doc_id":   str(doc.id),
         "filename": file.filename,
         "chunks":   stored,
         "message":  f"'{file.filename}' 업로드 완료 ({stored}청크 저장)",
@@ -102,23 +105,19 @@ async def upload_document(
 @router.get("/list")
 async def list_documents(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     """현재 사용자가 업로드한 문서 목록을 반환한다."""
-    cursor = (
-        mdb.uploaded_docs
-        .find(
-            {"user_id": user["id"]},
-            {"_id": 1, "filename": 1, "chunks": 1, "file_size": 1, "ext": 1, "created_at": 1},
-        )
-        .sort("created_at", -1)
+    result = await db.execute(
+        select(UploadedDoc)
+        .where(UploadedDoc.user_id == uuid.UUID(user["id"]))
+        .order_by(UploadedDoc.created_at.desc())
         .limit(100)
     )
-
-    items = []
-    async for doc in cursor:
-        doc["doc_id"] = str(doc.pop("_id"))
-        items.append(doc)
+    items = [{
+        "doc_id": str(d.id), "filename": d.filename, "chunks": d.chunks,
+        "file_size": d.file_size, "ext": d.ext, "created_at": d.created_at.isoformat(),
+    } for d in result.scalars().all()]
 
     return {"items": items}
 
@@ -129,30 +128,33 @@ async def list_documents(
 async def delete_document(
     doc_id: str,
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     """
-    문서의 MongoDB 메타데이터와 Qdrant 벡터를 모두 삭제한다.
+    문서의 PostgreSQL 메타데이터와 Qdrant 벡터를 모두 삭제한다.
     본인이 업로드한 문서만 삭제할 수 있다.
     """
     try:
-        oid = ObjectId(doc_id)
+        oid = uuid.UUID(doc_id)
     except Exception:
         raise HTTPException(400, "유효하지 않은 doc_id입니다.")
 
-    doc = await mdb.uploaded_docs.find_one({"_id": oid, "user_id": user["id"]})
+    result = await db.execute(
+        select(UploadedDoc).where(UploadedDoc.id == oid, UploadedDoc.user_id == uuid.UUID(user["id"]))
+    )
+    doc = result.scalar_one_or_none()
     if not doc:
         raise HTTPException(404, "문서를 찾을 수 없거나 삭제 권한이 없습니다.")
 
     # Qdrant 벡터 삭제 (source_key로 필터링)
-    source_key = doc.get("source_key", "")
-    if source_key:
-        await delete_chunks_by_source(source_key, collection=settings.DOCUMENT_COLLECTION)
+    if doc.source_key:
+        await delete_chunks_by_source(doc.source_key, collection=settings.DOCUMENT_COLLECTION)
 
-    # MongoDB 메타 삭제
-    await mdb.uploaded_docs.delete_one({"_id": oid})
+    filename = doc.filename
+    await db.delete(doc)
+    await db.commit()
 
-    return {"ok": True, "message": f"'{doc['filename']}' 삭제 완료"}
+    return {"ok": True, "message": f"'{filename}' 삭제 완료"}
 
 
 # ── 문서 전용 RAG 검색 ────────────────────────────────────────────────────────

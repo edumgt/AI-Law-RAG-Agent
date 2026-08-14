@@ -136,14 +136,14 @@ resource "aws_security_group" "ecs" {
   tags = { Name = "lumina-ecs-sg" }
 }
 
-resource "aws_security_group" "docdb" {
-  name        = "lumina-docdb-sg"
-  description = "DocumentDB: allow 27017 from ECS"
+resource "aws_security_group" "postgres" {
+  name        = "lumina-postgres-sg"
+  description = "PostgreSQL (RDS): allow 5432 from ECS"
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    from_port       = 27017
-    to_port         = 27017
+    from_port       = 5432
+    to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.ecs.id]
   }
@@ -155,7 +155,7 @@ resource "aws_security_group" "docdb" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = { Name = "lumina-docdb-sg" }
+  tags = { Name = "lumina-postgres-sg" }
 }
 
 resource "aws_security_group" "ec2_services" {

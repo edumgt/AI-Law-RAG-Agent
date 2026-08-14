@@ -50,10 +50,10 @@
     lumina_osaka_alb_subnet_ids:
       - "{{ lumina_osaka_subnet_id_map.app_a }}"
       - "{{ lumina_osaka_subnet_id_map.app_b }}"
-    lumina_osaka_docdb_subnet_ids:
-      - "{{ lumina_osaka_subnet_id_map.docdb_a }}"
-      - "{{ lumina_osaka_subnet_id_map.docdb_b }}"
-      - "{{ lumina_osaka_subnet_id_map.docdb_c }}"
+    lumina_osaka_postgres_subnet_ids:
+      - "{{ lumina_osaka_subnet_id_map.postgres_a }}"
+      - "{{ lumina_osaka_subnet_id_map.postgres_b }}"
+      - "{{ lumina_osaka_subnet_id_map.postgres_c }}"
     lumina_osaka_public_subnet_id: "{{ lumina_osaka_subnet_id_map.public_c }}"
 
 - name: Ensure Osaka main route table exists
@@ -64,9 +64,9 @@
       - "{{ lumina_osaka_subnet_id_map.app_a }}"
       - "{{ lumina_osaka_subnet_id_map.app_b }}"
       - "{{ lumina_osaka_subnet_id_map.public_c }}"
-      - "{{ lumina_osaka_subnet_id_map.docdb_a }}"
-      - "{{ lumina_osaka_subnet_id_map.docdb_b }}"
-      - "{{ lumina_osaka_subnet_id_map.docdb_c }}"
+      - "{{ lumina_osaka_subnet_id_map.postgres_a }}"
+      - "{{ lumina_osaka_subnet_id_map.postgres_b }}"
+      - "{{ lumina_osaka_subnet_id_map.postgres_c }}"
     routes:
       - dest: 0.0.0.0/0
         gateway_id: "{{ lumina_osaka_igw_result.gateway_id }}"

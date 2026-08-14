@@ -21,19 +21,21 @@ def financial_ingest_task(self) -> dict:
     """CSV 금융 데이터(개인CB·기업CB·금융상품) 전체 인제스트."""
 
     async def _async() -> dict:
-        from app.database.mongo import connect_mongo, close_mongo, get_mongo_db
+        from app.database.postgres import connect_postgres, close_postgres, get_session_factory
         from app.lib.redis_cache import connect_redis, close_redis
         from app.services.financial_ingest import run_full_ingest
 
         await connect_redis()
-        await connect_mongo()
+        await connect_postgres()
         log: list[str] = []
         try:
-            result = await run_full_ingest(get_mongo_db(), log)
+            session_factory = get_session_factory()
+            async with session_factory() as db:
+                result = await run_full_ingest(db, log)
             return {"ok": True, "result": result, "log": log}
         finally:
             await close_redis()
-            await close_mongo()
+            await close_postgres()
 
     return asyncio.run(_async())
 
@@ -49,21 +51,23 @@ def auto_crawl_task(self) -> dict:
 
     async def _async() -> dict:
         from app.config import settings
-        from app.database.mongo import connect_mongo, close_mongo, get_mongo_db
+        from app.database.postgres import connect_postgres, close_postgres, get_session_factory
         from app.lib.redis_cache import connect_redis, close_redis
         from app.lib.ollama import OllamaClient
         from app.services.crawl import run_auto_crawl
 
         await connect_redis()
-        await connect_mongo()
+        await connect_postgres()
         log: list[str] = []
         try:
             ollama = OllamaClient(settings.OLLAMA_BASE_URL, settings.OLLAMA_TIMEOUT)
-            result = await run_auto_crawl(get_mongo_db(), ollama, log)
+            session_factory = get_session_factory()
+            async with session_factory() as db:
+                result = await run_auto_crawl(db, ollama, log)
             return {"ok": True, "result": result, "log": log}
         finally:
             await close_redis()
-            await close_mongo()
+            await close_postgres()
 
     try:
         return asyncio.run(_async())
@@ -83,21 +87,23 @@ def url_crawl_task(self, url: str) -> dict:
 
     async def _async() -> dict:
         from app.config import settings
-        from app.database.mongo import connect_mongo, close_mongo, get_mongo_db
+        from app.database.postgres import connect_postgres, close_postgres, get_session_factory
         from app.lib.redis_cache import connect_redis, close_redis
         from app.lib.ollama import OllamaClient
         from app.services.crawl import crawl_url
 
         await connect_redis()
-        await connect_mongo()
+        await connect_postgres()
         log: list[str] = []
         try:
             ollama = OllamaClient(settings.OLLAMA_BASE_URL, settings.OLLAMA_TIMEOUT)
-            chunks = await crawl_url(url, get_mongo_db(), ollama, log)
+            session_factory = get_session_factory()
+            async with session_factory() as db:
+                chunks = await crawl_url(url, db, ollama, log)
             return {"ok": True, "chunks": chunks, "log": log}
         finally:
             await close_redis()
-            await close_mongo()
+            await close_postgres()
 
     try:
         return asyncio.run(_async())

@@ -3,6 +3,14 @@
 `lumina-invest`의 AWS 포팅 및 운영 정보를 정리한 단일 문서입니다.  
 이 문서는 기존 `README.md`와 `readme2.md`를 합친 기준 문서이며, 실제 리소스 값과 운영 메모를 함께 담고 있습니다.
 
+> **DB 마이그레이션 진행 중 (MongoDB/DocumentDB → PostgreSQL)**：애플리케이션 코드와 Terraform/Ansible IaC는
+> PostgreSQL(RDS)을 기준으로 이미 갱신되었습니다 (`terraform/postgres.tf`,
+> `ansible/roles/lumina_osaka/tasks/postgres.yml`). 다만 아래 "현재 배포 상태" 표는 **아직 실제로
+> `terraform apply`/`ansible-playbook`을 재실행하지 않은 시점의 as-built 기록**이라 DocumentDB 값을 그대로
+> 담고 있습니다. 실제 AWS 인프라를 PostgreSQL로 전환하려면 `terraform apply`로 RDS 인스턴스를 새로 만들고,
+> Secrets Manager의 `DATABASE_URL`을 채운 뒤 ECS 서비스를 재배포해야 합니다 — 이 문서만 갱신한다고
+> 실제 인프라가 바뀌지 않습니다.
+
 ## Ansible IaC
 
 `aws-work/ansible` 아래에 현재 운영값을 기준으로 한 Ansible IaC 프로젝트를 추가했습니다.
@@ -164,11 +172,10 @@ DocumentDB lumina-docdb :27017
 
 | 변수 | 값 |
 |------|----|
-| `MONGO_DB` | `fin_agent` |
 | `TRUST_PROXY` | `true` |
 | `COOKIE_SECURE` | `false` |
 | `REDIS_URL` | `redis://172.30.2.131:6379` |
-| `MONGO_URI` | DocumentDB (TLS) |
+| `DATABASE_URL` | PostgreSQL (RDS, asyncpg) — 마이그레이션 후 값 |
 
 ### Lambda
 
@@ -542,7 +549,7 @@ export SECRET_ARN=arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:lumina-i
 
 ## 배포 및 운영 절차
 
-### 1. DocDB 비밀번호 업데이트
+### 1. PostgreSQL 비밀번호 업데이트 (마이그레이션 후)
 
 ```bash
 python3 - <<'EOF'
@@ -557,10 +564,10 @@ result = subprocess.run(
 secret = json.loads(result.stdout.strip())
 
 ACTUAL_PASSWORD = "여기에실제비밀번호"
-secret["MONGO_URI"] = re.sub(
-    r'(mongodb://docdbuser:)[^@]+(@)',
+secret["DATABASE_URL"] = re.sub(
+    r'(postgresql\+asyncpg://pguser:)[^@]+(@)',
     rf'\g<1>{ACTUAL_PASSWORD}\2',
-    secret["MONGO_URI"]
+    secret["DATABASE_URL"]
 )
 
 subprocess.run(

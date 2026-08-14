@@ -1,0 +1,105 @@
+---
+- name: Ensure Osaka PostgreSQL security group exists
+  amazon.aws.ec2_security_group:
+    name: "{{ lumina_osaka.security_groups.postgres }}"
+    description: PostgreSQL (RDS) access for Lumina Osaka
+    vpc_id: "{{ lumina_osaka_vpc_id }}"
+    rules:
+      - proto: tcp
+        from_port: 5432
+        to_port: 5432
+        group_name:
+          - "{{ lumina_osaka.security_groups.ecs }}"
+        rule_desc: ECS to PostgreSQL
+    rules_egress:
+      - proto: -1
+        cidr_ip:
+          - 0.0.0.0/0
+    tags: "{{ lumina_osaka.tags | combine({'Name': lumina_osaka.security_groups.postgres}) }}"
+
+- name: Create or update Osaka PostgreSQL subnet group
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if aws rds describe-db-subnet-groups --region {{ aws_region }} --db-subnet-group-name {{ lumina_osaka.postgres.subnet_group_name }} >/dev/null 2>&1; then
+      aws rds modify-db-subnet-group \
+        --region {{ aws_region }} \
+        --db-subnet-group-name {{ lumina_osaka.postgres.subnet_group_name }} \
+        --db-subnet-group-description "Lumina Osaka PostgreSQL subnet group" \
+        --subnet-ids {{ lumina_osaka_postgres_subnet_ids | join(' ') }} >/dev/null
+    else
+      aws rds create-db-subnet-group \
+        --region {{ aws_region }} \
+        --db-subnet-group-name {{ lumina_osaka.postgres.subnet_group_name }} \
+        --db-subnet-group-description "Lumina Osaka PostgreSQL subnet group" \
+        --subnet-ids {{ lumina_osaka_postgres_subnet_ids | join(' ') }} >/dev/null
+    fi
+  args:
+    executable: /bin/bash
+  changed_when: true
+
+- name: Create Osaka PostgreSQL instance if absent
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if aws rds describe-db-instances --region {{ aws_region }} --db-instance-identifier {{ lumina_osaka.postgres.instance_identifier }} >/dev/null 2>&1; then
+      echo exists
+    else
+      aws rds create-db-instance \
+        --region {{ aws_region }} \
+        --db-instance-identifier {{ lumina_osaka.postgres.instance_identifier }} \
+        --engine postgres \
+        --engine-version 16 \
+        --db-instance-class {{ lumina_osaka.postgres.instance_class }} \
+        --allocated-storage 20 \
+        --master-username {{ lumina_osaka.postgres.master_username }} \
+        --master-user-password '{{ lumina_osaka_postgres_master_password }}' \
+        --db-name {{ lumina_osaka.postgres.db_name }} \
+        --db-subnet-group-name {{ lumina_osaka.postgres.subnet_group_name }} \
+        --vpc-security-group-ids "$(aws ec2 describe-security-groups --region {{ aws_region }} --filters Name=group-name,Values={{ lumina_osaka.security_groups.postgres }} Name=vpc-id,Values={{ lumina_osaka_vpc_id }} --query 'SecurityGroups[0].GroupId' --output text)" \
+        --storage-encrypted >/dev/null
+      echo created
+    fi
+  args:
+    executable: /bin/bash
+  register: lumina_osaka_postgres_instance_create
+  changed_when: "'created' in lumina_osaka_postgres_instance_create.stdout"
+
+- name: Wait for Osaka PostgreSQL instance
+  ansible.builtin.command:
+    argv:
+      - aws
+      - rds
+      - describe-db-instances
+      - --region
+      - "{{ aws_region }}"
+      - --db-instance-identifier
+      - "{{ lumina_osaka.postgres.instance_identifier }}"
+      - --query
+      - DBInstances[0].DBInstanceStatus
+      - --output
+      - text
+  register: lumina_osaka_postgres_instance_status
+  changed_when: false
+  until: lumina_osaka_postgres_instance_status.stdout == "available"
+  retries: 60
+  delay: 30
+
+- name: Read Osaka PostgreSQL endpoint
+  ansible.builtin.command:
+    argv:
+      - aws
+      - rds
+      - describe-db-instances
+      - --region
+      - "{{ aws_region }}"
+      - --db-instance-identifier
+      - "{{ lumina_osaka.postgres.instance_identifier }}"
+      - --query
+      - DBInstances[0].Endpoint.Address
+      - --output
+      - text
+  register: lumina_osaka_postgres_endpoint_result
+  changed_when: false
+
+- name: Set Osaka PostgreSQL endpoint fact
+  ansible.builtin.set_fact:
+    lumina_osaka_postgres_endpoint: "{{ lumina_osaka_postgres_endpoint_result.stdout }}"

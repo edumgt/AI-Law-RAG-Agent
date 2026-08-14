@@ -1,17 +1,28 @@
 """금융 AI Agent - FastAPI 메인 엔트리포인트."""
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse
 
-from app.database.mongo import connect_mongo, close_mongo, ensure_indexes
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
+
+from app.database.postgres import connect_postgres, close_postgres
 from app.database.neo4j import connect_neo4j, close_neo4j, ensure_graph_schema
 from app.lib.redis_cache import connect_redis, close_redis
 from app.routes import health, chat, stocks, library, admin, system, quant, ml, macro, documents, notification, graph, conversations, tasks
-from app.services.data_cache import ensure_cache_index
 from app.services.graph_service import seed_graph
 from app.services.sync_scheduler import start_sync_scheduler, stop_sync_scheduler
+
+
+def _run_migrations() -> None:
+    """PostgreSQL 스키마를 최신 Alembic revision으로 맞춘다 (Mongo ensure_indexes()의 후신)."""
+    root = os.path.join(os.path.dirname(__file__), "..")
+    cfg = AlembicConfig(os.path.join(root, "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(root, "alembic"))
+    alembic_command.upgrade(cfg, "head")
 
 
 @asynccontextmanager
@@ -22,11 +33,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[WARN] Redis 연결 실패 (세션 비활성): {e}")
     try:
-        await connect_mongo()
-        await ensure_indexes()
-        await ensure_cache_index()
+        # alembic의 command.upgrade()는 내부적으로 asyncio.run()을 새로 여는데,
+        # 이미 실행 중인 uvicorn 이벤트 루프 안에서 그대로 부르면 충돌한다.
+        # 별도 스레드에서 돌려 독립된 루프를 갖게 한다.
+        await asyncio.get_event_loop().run_in_executor(None, _run_migrations)
+        await connect_postgres()
     except Exception as e:
-        print(f"[WARN] MongoDB 연결 실패 (인증 비활성): {e}")
+        print(f"[WARN] PostgreSQL 연결 실패 (인증 비활성): {e}")
     try:
         await connect_neo4j()
         await ensure_graph_schema()
@@ -35,12 +48,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[WARN] Neo4j 연결 실패 (그래프 기능 비활성): {e}")
     start_sync_scheduler()
-    print("[fin-agent] 서버 시작 완료. JWT + Supabase + 대화이력 기능 활성화")
+    print("[fin-agent] 서버 시작 완료. JWT + PostgreSQL + 대화이력 기능 활성화")
     yield
     # 종료
     stop_sync_scheduler()
     await close_redis()
-    await close_mongo()
+    await close_postgres()
     await close_neo4j()
 
 

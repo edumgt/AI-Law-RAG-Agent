@@ -15,7 +15,7 @@
     lumina_osaka_api_secret_refs:
       - { name: "SESSION_SECRET", valueFrom: "{{ lumina_osaka.secret.name }}:SESSION_SECRET::" }
       - { name: "JWT_SECRET", valueFrom: "{{ lumina_osaka.secret.name }}:JWT_SECRET::" }
-      - { name: "MONGO_URI", valueFrom: "{{ lumina_osaka.secret.name }}:MONGO_URI::" }
+      - { name: "DATABASE_URL", valueFrom: "{{ lumina_osaka.secret.name }}:DATABASE_URL::" }
       - { name: "REDIS_URL", valueFrom: "{{ lumina_osaka.secret.name }}:REDIS_URL::" }
       - { name: "OLLAMA_BASE_URL", valueFrom: "{{ lumina_osaka.secret.name }}:OLLAMA_BASE_URL::" }
       - { name: "QDRANT_URL", valueFrom: "{{ lumina_osaka.secret.name }}:QDRANT_URL::" }
@@ -23,7 +23,7 @@
       - { name: "NEO4J_USER", valueFrom: "{{ lumina_osaka.secret.name }}:NEO4J_USER::" }
       - { name: "NEO4J_PASSWORD", valueFrom: "{{ lumina_osaka.secret.name }}:NEO4J_PASSWORD::" }
     lumina_osaka_worker_secret_refs:
-      - { name: "MONGO_URI", valueFrom: "{{ lumina_osaka.secret.name }}:MONGO_URI::" }
+      - { name: "DATABASE_URL", valueFrom: "{{ lumina_osaka.secret.name }}:DATABASE_URL::" }
       - { name: "REDIS_URL", valueFrom: "{{ lumina_osaka.secret.name }}:REDIS_URL::" }
       - { name: "OLLAMA_BASE_URL", valueFrom: "{{ lumina_osaka.secret.name }}:OLLAMA_BASE_URL::" }
       - { name: "QDRANT_URL", valueFrom: "{{ lumina_osaka.secret.name }}:QDRANT_URL::" }

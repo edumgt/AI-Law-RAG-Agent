@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 from typing import Any
 
+from app.services import ta_utils as ta
+
 try:
     import lightgbm as lgb
     HAS_LGB = True
@@ -68,25 +70,15 @@ def feature_engineer(df: pd.DataFrame) -> pd.DataFrame:
     out["ma20_ratio"] = c / ma20.replace(0, np.nan)
 
     # RSI (14)
-    delta = c.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    out["rsi"] = 100 - (100 / (1 + rs))
+    out["rsi"] = ta.rsi(c, 14)
 
     # MACD (12/26/9)
-    ema12 = c.ewm(span=12, adjust=False).mean()
-    ema26 = c.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_sig = macd.ewm(span=9, adjust=False).mean()
-    out["macd"]      = macd
-    out["macd_hist"] = macd - macd_sig
+    macd_line, _macd_sig, macd_hist = ta.macd(c, 12, 26, 9)
+    out["macd"]      = macd_line
+    out["macd_hist"] = macd_hist
 
     # 볼린저밴드 (20, 2σ)
-    bb_mid = c.rolling(20).mean()
-    bb_std = c.rolling(20).std()
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
+    bb_upper, bb_mid, bb_lower = ta.bollinger(c, 20, 2.0)
     bb_range = (bb_upper - bb_lower).replace(0, np.nan)
     out["bb_width"] = bb_range / bb_mid.replace(0, np.nan)
     out["bb_pos"]   = (c - bb_lower) / bb_range
@@ -96,9 +88,7 @@ def feature_engineer(df: pd.DataFrame) -> pd.DataFrame:
     out["vol_ratio"] = v / vol_ma20.replace(0, np.nan)
 
     # ATR (14)
-    h, l, pc = out["high"].astype(float), out["low"].astype(float), c.shift(1)
-    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-    out["atr"] = tr.rolling(14).mean()
+    out["atr"] = ta.atr(out["high"].astype(float), out["low"].astype(float), c, 14)
 
     # 타깃: 5일 후 수익률 → 3-class 레이블 (1=매수, 0=관망, -1=매도)
     fut = c.pct_change(5).shift(-5)
@@ -257,12 +247,8 @@ def backtest(df: pd.DataFrame, signals: pd.Series) -> dict:
     total_strat = float(cum_strat.iloc[-1] - 1) * 100
     total_bh    = float(cum_bh.iloc[-1] - 1)    * 100
 
-    ann = 252 ** 0.5
-    sharpe = float(strat_ret.mean() / strat_ret.std() * ann) if strat_ret.std() > 0 else 0.0
-
-    roll_max  = cum_strat.cummax()
-    drawdown  = (cum_strat - roll_max) / roll_max.replace(0, np.nan)
-    mdd       = float(drawdown.min()) * 100
+    sharpe = ta.sharpe_ratio(strat_ret)
+    mdd    = ta.max_drawdown(cum_strat) * 100
 
     # 승률 (보유 구간만)
     held_rets = strat_ret[pos == 1]
@@ -416,12 +402,16 @@ async def run_pipeline(
 
 def backtest_custom_indicator(
     candles: list[dict],
+    base: str = "rsi_ma",
     short_window: int = 5,
     mid_window: int = 20,
     rsi_period: int = 14,
     buy_threshold: float = 35.0,
 ) -> dict:
-    """사용자 지정(MA+RSI) 전략 백테스트."""
+    """사용자 지정 인디케이터 전략 백테스트.
+
+    base: rsi_ma | macd_bb | volume_rsi | triple_ma
+    """
     if len(candles) < 80:
         return {"error": f"데이터 부족: {len(candles)}개 (최소 80개 필요)"}
 
@@ -434,19 +424,29 @@ def backtest_custom_indicator(
     df = preprocess(candles)
     close = df["close"].astype(float)
 
-    ma_short = close.rolling(short_window).mean()
-    ma_mid = close.rolling(mid_window).mean()
-
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(rsi_period).mean()
-    loss = (-delta.clip(upper=0)).rolling(rsi_period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
+    ma_short = ta.sma(close, short_window)
+    ma_mid = ta.sma(close, mid_window)
+    rsi = ta.rsi(close, rsi_period)
 
     golden_cross = (ma_short > ma_mid) & (ma_short.shift(1) <= ma_mid.shift(1))
     dead_cross = (ma_short < ma_mid) & (ma_short.shift(1) >= ma_mid.shift(1))
-    buy_cond = golden_cross & (rsi < buy_threshold)
-    sell_cond = dead_cross | (rsi > sell_threshold)
+    base = base if base in ("rsi_ma", "macd_bb", "volume_rsi", "triple_ma") else "rsi_ma"
+    if base == "macd_bb":
+        macd_line, macd_signal, _ = ta.macd(close, 12, 26, 9)
+        bb_upper, bb_mid, _bb_lower = ta.bollinger(close, mid_window, 2.0)
+        buy_cond = (macd_line > macd_signal) & (macd_line.shift(1) <= macd_signal.shift(1)) & (close < bb_mid)
+        sell_cond = (macd_line < macd_signal) & (macd_line.shift(1) >= macd_signal.shift(1)) | (close > bb_upper)
+    elif base == "volume_rsi":
+        volume_ma = df["volume"].astype(float).rolling(mid_window).mean()
+        buy_cond = (rsi < buy_threshold) & (df["volume"] > volume_ma)
+        sell_cond = rsi > sell_threshold
+    elif base == "triple_ma":
+        long_ma = close.rolling(max(mid_window * 2, mid_window + 1)).mean()
+        buy_cond = golden_cross & (ma_mid > long_ma)
+        sell_cond = dead_cross | (ma_mid < long_ma)
+    else:
+        buy_cond = golden_cross & (rsi < buy_threshold)
+        sell_cond = dead_cross | (rsi > sell_threshold)
 
     regime = pd.Series(np.nan, index=df.index)
     regime.loc[buy_cond] = 1.0
@@ -456,7 +456,8 @@ def backtest_custom_indicator(
     bt = backtest(df, position)
     return {
         "strategy": {
-            "name": "custom_ma_rsi",
+            "name": f"custom_{base}",
+            "base": base,
             "short_window": short_window,
             "mid_window": mid_window,
             "rsi_period": rsi_period,

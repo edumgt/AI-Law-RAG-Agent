@@ -18,18 +18,18 @@ def sync_market_data() -> dict:
     """시장 지수·매크로·섹터 ETF·미국 주식 데이터를 캐싱한다 (1시간 주기)."""
 
     async def _async() -> dict:
-        from app.database.mongo import connect_mongo, close_mongo
+        from app.database.postgres import connect_postgres, close_postgres
         from app.lib.redis_cache import connect_redis, close_redis
         from app.services.sync_scheduler import sync_all
 
         await connect_redis()
-        await connect_mongo()
+        await connect_postgres()
         try:
             # force=True: 오프라인 체크 없이 항상 실행
             return await sync_all(force=True)
         finally:
             await close_redis()
-            await close_mongo()
+            await close_postgres()
 
     result = asyncio.run(_async())
     logger.info("[beat] sync_market_data 완료: %s", result)
@@ -41,18 +41,18 @@ def sync_stock_candles() -> dict:
     """주요 종목 캔들 데이터와 퀀트 지표를 일 1회 캐싱한다."""
 
     async def _async() -> dict:
-        from app.database.mongo import connect_mongo, close_mongo
+        from app.database.postgres import connect_postgres, close_postgres
         from app.lib.redis_cache import connect_redis, close_redis
         from app.services.sync_scheduler import _sync_stock_candles
 
         await connect_redis()
-        await connect_mongo()
+        await connect_postgres()
         try:
             await _sync_stock_candles()
             return {"ok": True}
         finally:
             await close_redis()
-            await close_mongo()
+            await close_postgres()
 
     result = asyncio.run(_async())
     logger.info("[beat] sync_stock_candles 완료")

@@ -1,6 +1,10 @@
-"""MongoDB-based financial data query tools for the ReAct agent."""
+"""PostgreSQL-based financial data query tools for the ReAct agent."""
 from typing import Any
-from motor.motor_asyncio import AsyncIOMotorDatabase
+
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import BankProduct, CorporateCbStat, FundProduct, PersonalCbStat
 
 GENDER_MAP = {1: "남성", 2: "여성"}
 AGE_MAP = {
@@ -18,6 +22,9 @@ INDUSTRY_MAP = {
     "S": "기타서비스",
 }
 
+_PCB_COLUMNS = {"stdt": PersonalCbStat.stdt, "gender": PersonalCbStat.gender, "age_band": PersonalCbStat.age_band}
+_CCB_COLUMNS = {"bs_dt": CorporateCbStat.bs_dt, "sic_cd": CorporateCbStat.sic_cd, "wg_gb": CorporateCbStat.wg_gb}
+
 
 def _industry_label(sic_cd: str | None) -> str:
     if not sic_cd:
@@ -25,134 +32,143 @@ def _industry_label(sic_cd: str | None) -> str:
     return INDUSTRY_MAP.get(sic_cd[0], sic_cd[0])
 
 
-async def query_personal_cb(db: AsyncIOMotorDatabase, args: dict[str, Any]) -> str:
+async def query_personal_cb(db: AsyncSession, args: dict[str, Any]) -> str:
     """개인 CB 신용 통계 조회."""
-    match: dict = {}
+    conditions = []
     if p := args.get("period"):
-        match["stdt"] = str(p)
+        conditions.append(PersonalCbStat.stdt == str(p))
     if g := args.get("gender"):
-        match["gender"] = int(g)
+        conditions.append(PersonalCbStat.gender == int(g))
     if a := args.get("age_band"):
-        match["age_band"] = int(a)
+        conditions.append(PersonalCbStat.age_band == int(a))
 
     group_by_str = args.get("group_by", "stdt,gender,age_band")
-    group_fields = [f.strip() for f in group_by_str.split(",")]
-    group_id = {f: f"${f}" for f in group_fields}
+    group_fields = [f.strip() for f in group_by_str.split(",") if f.strip() in _PCB_COLUMNS]
+    if not group_fields:
+        group_fields = ["stdt", "gender", "age_band"]
+    group_cols = [_PCB_COLUMNS[f] for f in group_fields]
 
-    pipeline = [
-        {"$match": match},
-        {"$group": {
-            "_id": group_id,
-            "total": {"$sum": "$cnt"},
-            "avg_score": {"$avg": "$avg_score"},
-            "avg_score_6m": {"$avg": "$avg_score_6m"},
-            "default_pct_raw": {"$avg": "$default_rate_1"},
-        }},
-        {"$project": {
-            "_id": 0,
-            **{f: f"$_id.{f}" for f in group_fields},
-            "total": 1,
-            "avg_score": {"$round": ["$avg_score", 1]},
-            "avg_score_6m": {"$round": ["$avg_score_6m", 1]},
-            "default_pct": {"$round": [{"$multiply": ["$default_pct_raw", 100]}, 2]},
-        }},
-        {"$sort": {"stdt": -1, "age_band": 1}},
-        {"$limit": 50},
-    ]
+    stmt = select(
+        *group_cols,
+        func.sum(PersonalCbStat.cnt).label("total"),
+        func.avg(PersonalCbStat.avg_score).label("avg_score"),
+        func.avg(PersonalCbStat.avg_score_6m).label("avg_score_6m"),
+        func.avg(PersonalCbStat.default_rate_1).label("default_pct_raw"),
+    ).group_by(*group_cols).limit(50)
+    if conditions:
+        stmt = stmt.where(and_(*conditions))
+    order_cols = []
+    if "stdt" in group_fields:
+        order_cols.append(PersonalCbStat.stdt.desc())
+    if "age_band" in group_fields:
+        order_cols.append(PersonalCbStat.age_band.asc())
+    if order_cols:
+        stmt = stmt.order_by(*order_cols)
 
-    rows = await db.personal_cb_stats.aggregate(pipeline).to_list(length=50)
+    result = await db.execute(stmt)
+    rows = result.all()
 
     if not rows:
         return "조회된 개인 CB 데이터가 없습니다. 먼저 데이터를 인제스트해주세요."
 
     lines = ["[개인 CB 신용 통계]"]
     for r in rows:
-        g_label = GENDER_MAP.get(r.get("gender"), str(r.get("gender")))
-        a_label = AGE_MAP.get(r.get("age_band"), str(r.get("age_band")))
+        gender_val = getattr(r, "gender", None)
+        age_band_val = getattr(r, "age_band", None)
+        stdt_val = getattr(r, "stdt", "-")
+        g_label = GENDER_MAP.get(gender_val, str(gender_val)) if gender_val is not None else "전체"
+        a_label = AGE_MAP.get(age_band_val, str(age_band_val)) if age_band_val is not None else "전체"
+        avg_score = round(r.avg_score, 1) if r.avg_score is not None else None
+        avg_score_6m = round(r.avg_score_6m, 1) if r.avg_score_6m is not None else None
+        default_pct = round(r.default_pct_raw * 100, 2) if r.default_pct_raw is not None else None
         lines.append(
-            f"기준월:{r.get('stdt')} | {g_label}/{a_label} | "
-            f"인원:{r.get('total', 0):,}명 | 평균신용점수:{r.get('avg_score')} | "
-            f"6개월전:{r.get('avg_score_6m')} | 연체율:{r.get('default_pct')}%"
+            f"기준월:{stdt_val} | {g_label}/{a_label} | "
+            f"인원:{r.total or 0:,}명 | 평균신용점수:{avg_score} | "
+            f"6개월전:{avg_score_6m} | 연체율:{default_pct}%"
         )
     return "\n".join(lines)
 
 
-async def query_corporate_cb(db: AsyncIOMotorDatabase, args: dict[str, Any]) -> str:
+async def query_corporate_cb(db: AsyncSession, args: dict[str, Any]) -> str:
     """기업 CB 신용 통계 조회."""
-    match: dict = {}
+    conditions = []
     if p := args.get("period"):
-        match["bs_dt"] = {"$regex": f"^{p}"}
+        conditions.append(CorporateCbStat.bs_dt.like(f"{p}%"))
     if s := args.get("sic_cd"):
-        match["sic_cd"] = {"$regex": f"^{s}"}
+        conditions.append(CorporateCbStat.sic_cd.like(f"{s}%"))
     if w := args.get("wg_gb"):
-        match["wg_gb"] = int(w)
+        conditions.append(CorporateCbStat.wg_gb == int(w))
 
     group_by_str = args.get("group_by", "bs_dt,sic_cd,wg_gb")
-    group_fields = [f.strip() for f in group_by_str.split(",")]
-    group_id = {f: f"${f}" for f in group_fields}
+    group_fields = [f.strip() for f in group_by_str.split(",") if f.strip() in _CCB_COLUMNS]
+    if not group_fields:
+        group_fields = ["bs_dt", "sic_cd", "wg_gb"]
+    group_cols = [_CCB_COLUMNS[f] for f in group_fields]
 
-    pipeline = [
-        {"$match": match},
-        {"$group": {
-            "_id": group_id,
-            "total": {"$sum": "$cnt"},
-            "avg_grade": {"$avg": "$avg_corp_grad"},
-            "default_pct_raw": {"$avg": "$default_rate"},
-        }},
-        {"$project": {
-            "_id": 0,
-            **{f: f"$_id.{f}" for f in group_fields},
-            "total": 1,
-            "avg_grade": {"$round": ["$avg_grade", 2]},
-            "default_pct": {"$round": [{"$multiply": ["$default_pct_raw", 100]}, 2]},
-        }},
-        {"$sort": {"bs_dt": -1, "sic_cd": 1}},
-        {"$limit": 50},
-    ]
+    stmt = select(
+        *group_cols,
+        func.sum(CorporateCbStat.cnt).label("total"),
+        func.avg(CorporateCbStat.avg_corp_grad).label("avg_grade"),
+        func.avg(CorporateCbStat.default_rate).label("default_pct_raw"),
+    ).group_by(*group_cols).limit(50)
+    if conditions:
+        stmt = stmt.where(and_(*conditions))
+    order_cols = []
+    if "bs_dt" in group_fields:
+        order_cols.append(CorporateCbStat.bs_dt.desc())
+    if "sic_cd" in group_fields:
+        order_cols.append(CorporateCbStat.sic_cd.asc())
+    if order_cols:
+        stmt = stmt.order_by(*order_cols)
 
-    rows = await db.corporate_cb_stats.aggregate(pipeline).to_list(length=50)
+    result = await db.execute(stmt)
+    rows = result.all()
 
     if not rows:
         return "조회된 기업 CB 데이터가 없습니다. 먼저 데이터를 인제스트해주세요."
 
     lines = ["[기업 CB 신용 통계]"]
     for r in rows:
-        w_label = SIZE_MAP.get(r.get("wg_gb"), str(r.get("wg_gb")))
-        ind_label = _industry_label(r.get("sic_cd"))
+        wg_gb_val = getattr(r, "wg_gb", None)
+        sic_cd_val = getattr(r, "sic_cd", None)
+        bs_dt_val = getattr(r, "bs_dt", "-")
+        w_label = SIZE_MAP.get(wg_gb_val, str(wg_gb_val)) if wg_gb_val is not None else "전체"
+        ind_label = _industry_label(sic_cd_val)
+        avg_grade = round(r.avg_grade, 2) if r.avg_grade is not None else None
+        default_pct = round(r.default_pct_raw * 100, 2) if r.default_pct_raw is not None else None
         lines.append(
-            f"기준일:{r.get('bs_dt')} | {w_label}/{ind_label} | "
-            f"기업수:{r.get('total', 0):,}개 | 평균신용등급:{r.get('avg_grade')} | "
-            f"연체율:{r.get('default_pct')}%"
+            f"기준일:{bs_dt_val} | {w_label}/{ind_label} | "
+            f"기업수:{r.total or 0:,}개 | 평균신용등급:{avg_grade} | "
+            f"연체율:{default_pct}%"
         )
     return "\n".join(lines)
 
 
-async def search_bank_products(db: AsyncIOMotorDatabase, args: dict[str, Any]) -> str:
+async def search_bank_products(db: AsyncSession, args: dict[str, Any]) -> str:
     """은행 수신상품 검색."""
-    query: dict = {}
+    conditions = []
     limit = min(int(args.get("limit", 10)), 20)
 
     if min_rate := args.get("min_rate"):
-        query["base_rate"] = {"$gte": float(min_rate)}
+        conditions.append(BankProduct.base_rate >= float(min_rate))
     if bank := args.get("bank_name"):
-        query["bank_name"] = {"$regex": bank, "$options": "i"}
+        conditions.append(BankProduct.bank_name.ilike(f"%{bank}%"))
     if dtype := args.get("deposit_type"):
-        query["deposit_type"] = {"$regex": dtype, "$options": "i"}
+        conditions.append(BankProduct.deposit_type.ilike(f"%{dtype}%"))
     if pg := args.get("product_group"):
-        query["product_group"] = {"$regex": pg, "$options": "i"}
+        conditions.append(BankProduct.product_group.ilike(f"%{pg}%"))
     if keyword := args.get("keyword"):
-        query["$or"] = [
-            {"product_name": {"$regex": keyword, "$options": "i"}},
-            {"product_summary": {"$regex": keyword, "$options": "i"}},
-        ]
+        conditions.append(or_(
+            BankProduct.product_name.ilike(f"%{keyword}%"),
+            BankProduct.product_summary.ilike(f"%{keyword}%"),
+        ))
 
-    projection = {"_id": 0, "bank_name": 1, "product_name": 1, "product_group": 1,
-                  "min_period": 1, "max_period": 1, "base_rate": 1, "max_rate": 1,
-                  "deposit_type": 1, "deposit_protection": 1, "product_summary": 1}
+    stmt = select(BankProduct).order_by(BankProduct.base_rate.desc().nullslast()).limit(limit)
+    if conditions:
+        stmt = stmt.where(and_(*conditions))
 
-    rows = await db.bank_products.find(query, projection).sort(
-        "base_rate", -1
-    ).limit(limit).to_list(length=limit)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
 
     if not rows:
         return "조건에 맞는 은행 수신상품이 없습니다."
@@ -160,57 +176,56 @@ async def search_bank_products(db: AsyncIOMotorDatabase, args: dict[str, Any]) -
     lines = [f"[은행 수신상품 검색 결과 - {len(rows)}건]"]
     for r in rows:
         lines.append(
-            f"■ {r.get('bank_name')} | {r.get('product_name')} ({r.get('product_group')})\n"
-            f"  기간:{r.get('min_period')}~{r.get('max_period')} | "
-            f"기본금리:{r.get('base_rate')}% | 최대금리:{r.get('max_rate')}% | "
-            f"예금자보호:{r.get('deposit_protection')} | "
-            f"상품유형:{r.get('deposit_type')}"
+            f"■ {r.bank_name} | {r.product_name} ({r.product_group})\n"
+            f"  기간:{r.min_period}~{r.max_period} | "
+            f"기본금리:{r.base_rate}% | 최대금리:{r.max_rate}% | "
+            f"예금자보호:{r.deposit_protection} | "
+            f"상품유형:{r.deposit_type}"
         )
     return "\n".join(lines)
 
 
-async def search_funds(db: AsyncIOMotorDatabase, args: dict[str, Any]) -> str:
+async def search_funds(db: AsyncSession, args: dict[str, Any]) -> str:
     """공모펀드 검색."""
-    query: dict = {}
+    conditions = []
     limit = min(int(args.get("limit", 10)), 20)
 
     if mt := args.get("main_type"):
-        query["main_type"] = {"$regex": mt, "$options": "i"}
+        conditions.append(FundProduct.main_type.ilike(f"%{mt}%"))
     if rg := args.get("max_risk_grade"):
-        query["risk_grade"] = {"$lte": int(rg)}
+        conditions.append(FundProduct.risk_grade <= int(rg))
     if mr := args.get("min_return_1y"):
-        query["return_1y"] = {"$gte": float(mr)}
+        conditions.append(FundProduct.return_1y >= float(mr))
     if args.get("is_retirement"):
-        query["is_retirement"] = True
+        conditions.append(FundProduct.is_retirement.is_(True))
     if args.get("is_esg"):
-        query["is_esg"] = True
+        conditions.append(FundProduct.is_esg.is_(True))
     if keyword := args.get("keyword"):
-        query["$or"] = [
-            {"fund_name": {"$regex": keyword, "$options": "i"}},
-            {"company_name": {"$regex": keyword, "$options": "i"}},
-            {"strategy": {"$regex": keyword, "$options": "i"}},
-        ]
+        conditions.append(or_(
+            FundProduct.fund_name.ilike(f"%{keyword}%"),
+            FundProduct.company_name.ilike(f"%{keyword}%"),
+            FundProduct.strategy.ilike(f"%{keyword}%"),
+        ))
 
-    projection = {"_id": 0, "fund_name": 1, "company_name": 1, "main_type": 1,
-                  "mid_type": 1, "risk_grade": 1, "return_1y": 1,
-                  "expense_ratio": 1, "aum": 1, "is_retirement": 1, "is_esg": 1}
+    stmt = select(FundProduct).order_by(FundProduct.return_1y.desc().nullslast()).limit(limit)
+    if conditions:
+        stmt = stmt.where(and_(*conditions))
 
-    rows = await db.fund_products.find(query, projection).sort(
-        "return_1y", -1
-    ).limit(limit).to_list(length=limit)
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
 
     if not rows:
         return "조건에 맞는 펀드 상품이 없습니다."
 
     lines = [f"[공모펀드 검색 결과 - {len(rows)}건]"]
     for r in rows:
-        retire = "✓퇴직연금" if r.get("is_retirement") else ""
-        esg = "✓ESG" if r.get("is_esg") else ""
-        aum = r.get("aum") or 0
+        retire = "✓퇴직연금" if r.is_retirement else ""
+        esg = "✓ESG" if r.is_esg else ""
+        aum = r.aum or 0
         lines.append(
-            f"■ {r.get('fund_name')} ({r.get('company_name')})\n"
-            f"  유형:{r.get('main_type')}/{r.get('mid_type')} | "
-            f"위험등급:{r.get('risk_grade')} | 1년수익률:{r.get('return_1y')}% | "
-            f"운용보수:{r.get('expense_ratio')}% | 순자산:{aum:,.0f}원 {retire}{esg}"
+            f"■ {r.fund_name} ({r.company_name})\n"
+            f"  유형:{r.main_type}/{r.mid_type} | "
+            f"위험등급:{r.risk_grade} | 1년수익률:{r.return_1y}% | "
+            f"운용보수:{r.expense_ratio}% | 순자산:{aum:,.0f}원 {retire}{esg}"
         )
     return "\n".join(lines)

@@ -35,23 +35,23 @@
           - 0.0.0.0/0
     tags: "{{ lumina_tags | combine({'Name': lumina_security_groups.ecs.name}) }}"
 
-- name: Ensure DocumentDB security group exists
+- name: Ensure PostgreSQL security group exists
   amazon.aws.ec2_security_group:
-    name: "{{ lumina_security_groups.docdb.name }}"
-    description: Security group for Lumina DocumentDB access
+    name: "{{ lumina_security_groups.postgres.name }}"
+    description: Security group for Lumina PostgreSQL (RDS) access
     vpc_id: "{{ lumina_vpc_id }}"
     rules:
       - proto: tcp
-        from_port: 27017
-        to_port: 27017
+        from_port: 5432
+        to_port: 5432
         group_name:
           - "{{ lumina_security_groups.ecs.name }}"
-        rule_desc: ECS to DocumentDB
+        rule_desc: ECS to PostgreSQL
     rules_egress:
       - proto: -1
         cidr_ip:
           - 0.0.0.0/0
-    tags: "{{ lumina_tags | combine({'Name': lumina_security_groups.docdb.name}) }}"
+    tags: "{{ lumina_tags | combine({'Name': lumina_security_groups.postgres.name}) }}"
 
 - name: Ensure dependency host security group exists
   amazon.aws.ec2_security_group:

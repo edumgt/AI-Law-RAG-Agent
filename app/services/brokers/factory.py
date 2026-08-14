@@ -2,6 +2,7 @@
 from .base import BrokerClient
 from .kis import KISClient
 from .ebest import EBestClient
+from .kb import KBClient
 from .kiwoom import KiwoomClient
 from .daishin import DaishinClient
 from .meritz import MeritzClient
@@ -16,7 +17,7 @@ def get_broker_client(
     paper: bool = True,
 ) -> BrokerClient:
     """
-    broker: "kis" | "kiwoom" | "daishin" | "meritz" | "shinhan" | "ebest" | "mock"
+    broker: "kis" | "kb" | "kiwoom" | "daishin" | "meritz" | "shinhan" | "ebest" | "mock"
     key/secret이 없으면 자동으로 MockBrokerClient 반환.
     """
     broker = (broker or "mock").lower()
@@ -24,6 +25,8 @@ def get_broker_client(
         return MockBrokerClient()
     if broker == "kis":
         return KISClient(app_key, app_secret, paper=paper)
+    if broker == "kb":
+        return KBClient(app_key, app_secret, paper=paper)
     if broker == "kiwoom":
         return KiwoomClient(app_key, app_secret)
     if broker == "daishin":

@@ -33,48 +33,54 @@ def run_agent_task(
     llm_model: str,
     rag_context: str = "",
 ) -> dict:
-    """LangGraph ReAct 에이전트를 워커에서 실행하고 채팅 기록을 MongoDB에 저장한다."""
+    """LangGraph ReAct 에이전트를 워커에서 실행하고 채팅 기록을 PostgreSQL에 저장한다."""
 
     async def _async() -> dict:
-        from bson import ObjectId
+        import uuid
+        from sqlalchemy import select
         from app.config import settings
-        from app.database.mongo import connect_mongo, close_mongo, get_mongo_db
+        from app.database.postgres import connect_postgres, close_postgres, get_session_factory
         from app.lib.redis_cache import connect_redis, close_redis
         from app.lib.ollama import OllamaClient
+        from app.models import Chat, Conversation
         from app.services.langgraph_agent import run_agent
 
         await connect_redis()
-        await connect_mongo()
+        await connect_postgres()
         try:
-            db = get_mongo_db()
-            ollama = OllamaClient(settings.OLLAMA_BASE_URL, settings.OLLAMA_TIMEOUT)
+            session_factory = get_session_factory()
+            async with session_factory() as db:
+                ollama = OllamaClient(settings.OLLAMA_BASE_URL, settings.OLLAMA_TIMEOUT)
 
-            result = await run_agent(
-                db, ollama, llm_model, question, history, rag_context
-            )
-
-            # 채팅 기록 + 스레드 통계 저장
-            try:
-                await db.chats.insert_one({
-                    "user_id": user_id,
-                    "conversation_id": conversation_id,
-                    "question": question,
-                    "answer": result["answer"],
-                    "steps": result.get("steps", []),
-                    "citations": result.get("citations", []),
-                    "created_at": _now(),
-                })
-                await db.conversations.update_one(
-                    {"_id": ObjectId(conversation_id)},
-                    {"$inc": {"message_count": 1}, "$set": {"updated_at": _now()}},
+                result = await run_agent(
+                    db, ollama, llm_model, question, history, rag_context
                 )
-            except Exception as e:
-                logger.warning("채팅 기록 저장 실패: %s", e)
+
+                # 채팅 기록 + 스레드 통계 저장
+                try:
+                    db.add(Chat(
+                        user_id=uuid.UUID(user_id),
+                        conversation_id=uuid.UUID(conversation_id),
+                        question=question,
+                        answer=result["answer"],
+                        steps=result.get("steps", []),
+                        citations=result.get("citations", []),
+                    ))
+                    conv_result = await db.execute(
+                        select(Conversation).where(Conversation.id == uuid.UUID(conversation_id))
+                    )
+                    conv = conv_result.scalar_one_or_none()
+                    if conv:
+                        conv.message_count += 1
+                    await db.commit()
+                except Exception as e:
+                    await db.rollback()
+                    logger.warning("채팅 기록 저장 실패: %s", e)
 
             return {**result, "conversation_id": conversation_id}
         finally:
             await close_redis()
-            await close_mongo()
+            await close_postgres()
 
     try:
         return asyncio.run(_async())

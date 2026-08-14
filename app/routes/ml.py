@@ -11,6 +11,7 @@ from app.services.ml_models import (
     seasonality_analysis,
     regression_forecast,
 )
+from app.services.investment_research import optimize_portfolio
 
 router = APIRouter(prefix="/api/ml")
 
@@ -111,6 +112,7 @@ async def robo_allocation(
 
     # 국내 대표 종목의 최근 수익률/변동성으로 간단 스코어링
     picks = []
+    stock_data = []
     for s in QUANT_STOCKS:
         data = await get_candles(s["symbol"], period="2y", interval="1d")
         candles = data.get("candles", [])
@@ -119,6 +121,7 @@ async def robo_allocation(
         closes = np.array([float(c["close"]) for c in candles if c.get("close") is not None], dtype=float)
         if len(closes) < 80:
             continue
+        stock_data.append({"symbol": s["symbol"], "candles": candles})
         rets = np.diff(closes) / closes[:-1]
         ann_ret = float(np.mean(rets) * 252)
         ann_vol = float(np.std(rets) * np.sqrt(252)) if np.std(rets) > 0 else 0.0001
@@ -135,13 +138,16 @@ async def robo_allocation(
     if not picks:
         raise HTTPException(422, "포트폴리오 계산용 시세 데이터가 부족합니다.")
 
-    picks.sort(key=lambda x: x["score"], reverse=True)
-    top = picks[:4 if risk == "aggressive" else 3]
-    sum_score = sum(max(0.01, p["score"] + 2.0) for p in top)
+    optimized = optimize_portfolio(stock_data, risk)
+    if "error" in optimized:
+        raise HTTPException(422, optimized["error"])
+    optimized_weights = optimized["weights"]
+    picks.sort(key=lambda x: optimized_weights.get(x["symbol"], 0), reverse=True)
+    top = [p for p in picks if p["symbol"] in optimized_weights]
     stock_bucket = alloc["국내주식"] + alloc["해외주식"]
     stock_picks = []
     for p in top:
-        w = round(stock_bucket * (max(0.01, p["score"] + 2.0) / sum_score), 1)
+        w = round(stock_bucket * optimized_weights[p["symbol"]] / 100, 1)
         stock_picks.append({
             "name": p["name"],
             "code": p["symbol"],
@@ -149,16 +155,9 @@ async def robo_allocation(
             "reason": f"연환산 수익률 {p['ann_return_pct']}%, 변동성 {p['ann_vol_pct']}%",
         })
 
-    exp_ret = {
-        "conservative": 0.045,
-        "moderate": 0.075,
-        "aggressive": 0.115,
-    }[risk]
-    exp_vol = {
-        "conservative": 0.05,
-        "moderate": 0.10,
-        "aggressive": 0.18,
-    }[risk]
+    # 최적화된 주식 바스켓의 과거 기대수익률을 전체 자산배분 비중에 반영
+    exp_ret = (optimized["expected_return_pct"] / 100) * (stock_bucket / 100) + 0.025 * (1 - stock_bucket / 100)
+    exp_vol = (optimized["expected_volatility_pct"] / 100) * (stock_bucket / 100)
     years = [1, 3, 5, 10]
     projections = []
     for y in years:
@@ -181,6 +180,7 @@ async def robo_allocation(
         "allocations": alloc,
         "stock_picks": stock_picks,
         "projections": projections,
+        "optimization": optimized,
     }
 
 

@@ -19,11 +19,8 @@
         "--concurrency=2",
         "--queues=celery"
       ],
-      "environment": [
-        { "name": "MONGO_DB", "value": "fin_agent" }
-      ],
       "secrets": [
-        { "name": "MONGO_URI",       "valueFrom": "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:MONGO_URI::" },
+        { "name": "DATABASE_URL",    "valueFrom": "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:DATABASE_URL::" },
         { "name": "REDIS_URL",       "valueFrom": "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:REDIS_URL::" },
         { "name": "OLLAMA_BASE_URL", "valueFrom": "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:OLLAMA_BASE_URL::" },
         { "name": "QDRANT_URL",      "valueFrom": "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:QDRANT_URL::" },

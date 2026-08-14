@@ -33,7 +33,7 @@
       lumina_vpc_id: "{{ lumina_vpc_id }}"
       lumina_app_subnets: "{{ lumina_subnet_ids.app }}"
       lumina_alb_subnets: "{{ lumina_alb.subnet_ids }}"
-      lumina_docdb_subnets: "{{ lumina_subnet_ids.docdb }}"
+      lumina_postgres_subnets: "{{ lumina_subnet_ids.postgres }}"
       lumina_secret_arn: "{{ lumina_secret.arn }}"
       lumina_alb_dns: "{{ lumina_alb.dns_name }}"
       lumina_cf_distribution_id: "{{ lumina_cloudfront.distribution_id }}"

@@ -2,8 +2,12 @@
 import csv
 import os
 from collections import defaultdict
-from motor.motor_asyncio import AsyncIOMotorDatabase
+
+from sqlalchemy import delete, insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import settings
+from app.models import BankProduct, CorporateCbStat, FundProduct, PersonalCbStat
 
 
 def _safe_float(v: str) -> float | None:
@@ -22,13 +26,13 @@ def _safe_int(v: str) -> int | None:
 
 
 # ── 개인 CB ──────────────────────────────────────────────────────────
-async def ingest_personal_cb(db: AsyncIOMotorDatabase, log: list[str]) -> int:
+async def ingest_personal_cb(db: AsyncSession, log: list[str]) -> int:
     data_dir = os.path.join(settings.DATA_DIR, "09.개인 CB정보")
     if not os.path.isdir(data_dir):
         log.append("[WARN] 개인CB 디렉토리 없음")
         return 0
 
-    await db.personal_cb_stats.delete_many({})
+    await db.execute(delete(PersonalCbStat))
 
     total_files, total_rows = 0, 0
 
@@ -99,23 +103,24 @@ async def ingest_personal_cb(db: AsyncIOMotorDatabase, log: list[str]) -> int:
                 "default_rate_2": round(a["sum_p2"] / cnt, 6),
             })
         if docs:
-            await db.personal_cb_stats.insert_many(docs)
+            await db.execute(insert(PersonalCbStat), docs)
 
         log.append(f"  → {rows_in_file:,}행 처리 / 집계 {len(docs)}건 저장")
         total_rows += rows_in_file
         total_files += 1
 
+    await db.commit()
     return total_rows
 
 
 # ── 기업 CB ──────────────────────────────────────────────────────────
-async def ingest_corporate_cb(db: AsyncIOMotorDatabase, log: list[str]) -> int:
+async def ingest_corporate_cb(db: AsyncSession, log: list[str]) -> int:
     data_dir = os.path.join(settings.DATA_DIR, "10.기업 CB정보")
     if not os.path.isdir(data_dir):
         log.append("[WARN] 기업CB 디렉토리 없음")
         return 0
 
-    await db.corporate_cb_stats.delete_many({})
+    await db.execute(delete(CorporateCbStat))
 
     total_rows = 0
 
@@ -175,22 +180,23 @@ async def ingest_corporate_cb(db: AsyncIOMotorDatabase, log: list[str]) -> int:
                 "default_rate": round(a["sum_d"] / cnt, 6),
             })
         if docs:
-            await db.corporate_cb_stats.insert_many(docs)
+            await db.execute(insert(CorporateCbStat), docs)
 
         log.append(f"  → {rows_in_file:,}행 처리 / 집계 {len(docs)}건 저장")
         total_rows += rows_in_file
 
+    await db.commit()
     return total_rows
 
 
 # ── 금융상품 ─────────────────────────────────────────────────────────
-async def ingest_bank_products(db: AsyncIOMotorDatabase, log: list[str]) -> int:
+async def ingest_bank_products(db: AsyncSession, log: list[str]) -> int:
     fpath = os.path.join(settings.DATA_DIR, "12.금융상품정보", "은행수신상품.csv")
     if not os.path.exists(fpath):
         log.append("[WARN] 은행수신상품.csv 없음")
         return 0
 
-    await db.bank_products.delete_many({})
+    await db.execute(delete(BankProduct))
     count = 0
     batch: list[dict] = []
 
@@ -198,41 +204,42 @@ async def ingest_bank_products(db: AsyncIOMotorDatabase, log: list[str]) -> int:
         reader = csv.DictReader(f)
         for row in reader:
             batch.append({
-                "bank_code": row.get("은행코드"),
-                "bank_name": row.get("은행명"),
-                "product_code": row.get("상품코드"),
-                "product_name": row.get("상품명"),
-                "product_group": row.get("상품그룹명"),
-                "min_period": row.get("계약기간개월수_최소구간"),
-                "max_period": row.get("계약기간개월수_최대구간"),
-                "min_amount": row.get("가입금액_최소구간"),
-                "max_amount": row.get("가입금액_최대구간"),
+                "bank_code": row.get("은행코드") or "",
+                "bank_name": row.get("은행명") or "",
+                "product_code": row.get("상품코드") or "",
+                "product_name": row.get("상품명") or "",
+                "product_group": row.get("상품그룹명") or "",
+                "min_period": row.get("계약기간개월수_최소구간") or "",
+                "max_period": row.get("계약기간개월수_최대구간") or "",
+                "min_amount": row.get("가입금액_최소구간") or "",
+                "max_amount": row.get("가입금액_최대구간") or "",
                 "base_rate": _safe_float(row.get("기본금리", "")),
                 "max_rate": _safe_float(row.get("최대우대금리", "")),
-                "deposit_type": row.get("예금입출금방식"),
-                "maturity": row.get("만기여부"),
-                "deposit_protection": row.get("예금자보호대상여부"),
+                "deposit_type": row.get("예금입출금방식") or "",
+                "maturity": row.get("만기여부") or "",
+                "deposit_protection": row.get("예금자보호대상여부") or "",
                 "product_summary": (row.get("상품개요_설명") or "")[:500],
             })
             count += 1
             if len(batch) >= 1000:
-                await db.bank_products.insert_many(batch)
+                await db.execute(insert(BankProduct), batch)
                 batch = []
 
     if batch:
-        await db.bank_products.insert_many(batch)
+        await db.execute(insert(BankProduct), batch)
 
+    await db.commit()
     log.append(f"[은행상품] {count:,}건 저장")
     return count
 
 
-async def ingest_fund_products(db: AsyncIOMotorDatabase, log: list[str]) -> int:
+async def ingest_fund_products(db: AsyncSession, log: list[str]) -> int:
     fpath = os.path.join(settings.DATA_DIR, "12.금융상품정보", "공모펀드상품.csv")
     if not os.path.exists(fpath):
         log.append("[WARN] 공모펀드상품.csv 없음")
         return 0
 
-    await db.fund_products.delete_many({})
+    await db.execute(delete(FundProduct))
     count = 0
     batch: list[dict] = []
 
@@ -240,13 +247,13 @@ async def ingest_fund_products(db: AsyncIOMotorDatabase, log: list[str]) -> int:
         reader = csv.DictReader(f)
         for row in reader:
             batch.append({
-                "eval_date": row.get("평가기준일"),
-                "fund_code": row.get("펀드코드"),
-                "fund_name": row.get("펀드명"),
-                "company_name": row.get("운용사명"),
-                "main_type": row.get("대유형"),
-                "mid_type": row.get("중유형"),
-                "sub_type": row.get("소유형"),
+                "eval_date": row.get("평가기준일") or "",
+                "fund_code": row.get("펀드코드") or "",
+                "fund_name": row.get("펀드명") or "",
+                "company_name": row.get("운용사명") or "",
+                "main_type": row.get("대유형") or "",
+                "mid_type": row.get("중유형") or "",
+                "sub_type": row.get("소유형") or "",
                 "strategy": (row.get("투자전략") or "")[:300],
                 "aum": _safe_float(row.get("순자산", "")),
                 "risk_grade": _safe_int(row.get("투자위험등급", "")),
@@ -258,17 +265,18 @@ async def ingest_fund_products(db: AsyncIOMotorDatabase, log: list[str]) -> int:
             })
             count += 1
             if len(batch) >= 1000:
-                await db.fund_products.insert_many(batch)
+                await db.execute(insert(FundProduct), batch)
                 batch = []
 
     if batch:
-        await db.fund_products.insert_many(batch)
+        await db.execute(insert(FundProduct), batch)
 
+    await db.commit()
     log.append(f"[공모펀드] {count:,}건 저장")
     return count
 
 
-async def run_full_ingest(db: AsyncIOMotorDatabase, log: list[str]) -> dict:
+async def run_full_ingest(db: AsyncSession, log: list[str]) -> dict:
     log.append("=== 금융 데이터 인제스트 시작 ===")
     pcb = await ingest_personal_cb(db, log)
     ccb = await ingest_corporate_cb(db, log)

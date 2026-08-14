@@ -1,11 +1,26 @@
 """크롤링 서비스: GitHub docs, 금융 포털, Qdrant RAG 구축."""
 import httpx
 import re
-from datetime import datetime, timezone
 from html.parser import HTMLParser
 from bs4 import BeautifulSoup
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.lib.ollama import OllamaClient
+from app.models import CrawledDoc
+
+
+async def _upsert_crawled_doc(db: AsyncSession, url: str, title: str, content: str, source: str) -> None:
+    stmt = pg_insert(CrawledDoc).values(
+        url=url, title=title, content=content[:5000], source=source, crawled_at=func.now(),
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[CrawledDoc.url],
+        set_={"title": title, "content": content[:5000], "source": source, "crawled_at": func.now()},
+    )
+    await db.execute(stmt)
+    await db.commit()
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
@@ -109,7 +124,7 @@ async def _store_qdrant(chunks: list[str], meta: dict, ollama: OllamaClient) -> 
 
 async def crawl_github_docs(
     owner: str, repo: str, branch: str, path: str,
-    mdb, ollama: OllamaClient, log: list[str],
+    db: AsyncSession, ollama: OllamaClient, log: list[str],
 ) -> int:
     """GitHub 레포의 markdown docs를 크롤링하여 Qdrant에 저장."""
     total = 0
@@ -154,13 +169,7 @@ async def crawl_github_docs(
             meta = {"url": url, "title": f["name"], "source": f"github:{owner}/{repo}"}
 
             stored = await _store_qdrant(chunks, meta, ollama)
-            await mdb.crawled_docs.update_one(
-                {"url": url},
-                {"$set": {"title": f["name"], "content": content[:5000],
-                           "source": f"github:{owner}/{repo}",
-                           "crawled_at": datetime.now(timezone.utc).isoformat()}},
-                upsert=True,
-            )
+            await _upsert_crawled_doc(db, url, f["name"], content, f"github:{owner}/{repo}")
             log.append(f"  ✓ {f['name']} → {len(chunks)}청크 (Qdrant {stored}건)")
             total += len(chunks)
 
@@ -168,7 +177,7 @@ async def crawl_github_docs(
 
 
 async def crawl_url(
-    url: str, mdb, ollama: OllamaClient, log: list[str],
+    url: str, db: AsyncSession, ollama: OllamaClient, log: list[str],
 ) -> int:
     """임의 URL 크롤링."""
     async with httpx.AsyncClient(
@@ -195,18 +204,13 @@ async def crawl_url(
 
     meta = {"url": url, "title": title_text, "source": "web"}
     stored = await _store_qdrant(chunks, meta, ollama)
-    await mdb.crawled_docs.update_one(
-        {"url": url},
-        {"$set": {"title": title_text, "content": text[:5000],
-                   "source": "web", "crawled_at": datetime.now(timezone.utc).isoformat()}},
-        upsert=True,
-    )
+    await _upsert_crawled_doc(db, url, title_text, text, "web")
     log.append(f"✓ {title_text[:50]} → {len(chunks)}청크 (Qdrant {stored}건)")
     return len(chunks)
 
 
 async def crawl_naver_stock(
-    code: str, mdb, ollama: OllamaClient, log: list[str],
+    code: str, db: AsyncSession, ollama: OllamaClient, log: list[str],
 ) -> int:
     """네이버 금융 종목 메인 페이지 전용 크롤링."""
     stock_code = re.sub(r"[^0-9]", "", code or "")
@@ -264,21 +268,12 @@ async def crawl_naver_stock(
         "stock_code": stock_code,
     }
     stored = await _store_qdrant(chunks, meta, ollama)
-    await mdb.crawled_docs.update_one(
-        {"url": url},
-        {"$set": {
-            "title": meta["title"],
-            "content": text[:5000],
-            "source": meta["source"],
-            "crawled_at": datetime.now(timezone.utc).isoformat(),
-        }},
-        upsert=True,
-    )
+    await _upsert_crawled_doc(db, url, meta["title"], text, meta["source"])
     log.append(f"✓ {meta['title']} → {len(chunks)}청크 (Qdrant {stored}건)")
     return len(chunks)
 
 
-async def run_auto_crawl(mdb, ollama: OllamaClient, log: list[str]) -> dict:
+async def run_auto_crawl(db: AsyncSession, ollama: OllamaClient, log: list[str]) -> dict:
     """자동 크롤링 실행."""
     total_chunks = 0
     for target in CRAWL_TARGETS:
@@ -286,7 +281,7 @@ async def run_auto_crawl(mdb, ollama: OllamaClient, log: list[str]) -> dict:
         if target["type"] == "github_docs":
             n = await crawl_github_docs(
                 target["owner"], target["repo"], target["branch"], target["path"],
-                mdb, ollama, log,
+                db, ollama, log,
             )
             total_chunks += n
 

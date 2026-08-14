@@ -1,10 +1,13 @@
 import os
-from datetime import datetime, timezone
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from app.database.mongo import get_mdb
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database.postgres import get_pg_session
 from app.lib.session import get_current_user
 from app.lib.ollama import get_ollama
+from app.models import CrawledDoc
 from app.services.financial_ingest import run_full_ingest
 from app.services.crawl import run_auto_crawl, crawl_url, crawl_naver_stock, _chunk_text, _store_qdrant
 from app.services.translation_ingest import (
@@ -19,21 +22,21 @@ router = APIRouter(prefix="/api")
 @router.post("/ingest/financial")
 async def ingest_financial(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     log: list[str] = []
-    result = await run_full_ingest(mdb, log)
+    result = await run_full_ingest(db, log)
     return {"ok": True, "result": result, "log": log}
 
 
 @router.post("/ingest/crawl/auto")
 async def crawl_auto(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     ollama = get_ollama()
     log: list[str] = []
-    result = await run_auto_crawl(mdb, ollama, log)
+    result = await run_auto_crawl(db, ollama, log)
     return {"ok": True, "result": result, "log": log}
 
 
@@ -45,11 +48,11 @@ class CrawlUrlBody(BaseModel):
 async def crawl_manual(
     body: CrawlUrlBody,
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     ollama = get_ollama()
     log: list[str] = []
-    chunks = await crawl_url(body.url, mdb, ollama, log)
+    chunks = await crawl_url(body.url, db, ollama, log)
     return {"ok": True, "chunks": chunks, "log": log}
 
 
@@ -61,12 +64,12 @@ class CrawlNaverBody(BaseModel):
 async def crawl_naver(
     body: CrawlNaverBody,
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     """네이버 금융 종목 페이지 전용 크롤링."""
     ollama = get_ollama()
     log: list[str] = []
-    chunks = await crawl_naver_stock(body.code, mdb, ollama, log)
+    chunks = await crawl_naver_stock(body.code, db, ollama, log)
     message = "네이버 주식 크롤링이 완료되었습니다." if chunks > 0 else "네이버 주식 크롤링 결과가 없습니다."
     return {"ok": True, "chunks": chunks, "message": message}
 
@@ -74,7 +77,7 @@ async def crawl_naver(
 @router.post("/ingest/local-docs")
 async def ingest_local_docs(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     """data/raw/ 하위 로컬 Markdown 문서를 Qdrant RAG에 인제스트."""
     ollama = get_ollama()
@@ -97,19 +100,17 @@ async def ingest_local_docs(
 
             chunks = _chunk_text(content)
             rel_path = os.path.relpath(fpath, raw_root)
-            meta = {
-                "url":    f"local://{rel_path}",
-                "title":  fname,
-                "source": f"local:{rel_path}",
-            }
+            url = f"local://{rel_path}"
+            source = f"local:{rel_path}"
+            meta = {"url": url, "title": fname, "source": source}
             stored = await _store_qdrant(chunks, meta, ollama)
-            await mdb.crawled_docs.update_one(
-                {"url": meta["url"]},
-                {"$set": {"title": fname, "content": content[:5000],
-                           "source": meta["source"],
-                           "crawled_at": datetime.now(timezone.utc).isoformat()}},
-                upsert=True,
+            stmt = pg_insert(CrawledDoc).values(url=url, title=fname, content=content[:5000], source=source)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[CrawledDoc.url],
+                set_={"title": fname, "content": content[:5000], "source": source},
             )
+            await db.execute(stmt)
+            await db.commit()
             log.append(f"✓ {rel_path} → {len(chunks)}청크 (Qdrant {stored}건)")
             total += len(chunks)
 
@@ -213,10 +214,15 @@ async def ingest_translation_async(
 @router.get("/ingest/crawl/list")
 async def list_crawled(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
-    cursor = mdb.crawled_docs.find(
-        {}, {"_id": 0, "url": 1, "title": 1, "source": 1, "crawled_at": 1}
-    ).sort("crawled_at", -1).limit(100)
-    items = [doc async for doc in cursor]
+    result = await db.execute(
+        select(CrawledDoc.url, CrawledDoc.title, CrawledDoc.source, CrawledDoc.crawled_at)
+        .order_by(CrawledDoc.crawled_at.desc())
+        .limit(100)
+    )
+    items = [
+        {"url": r.url, "title": r.title, "source": r.source, "crawled_at": r.crawled_at.isoformat()}
+        for r in result.all()
+    ]
     return {"items": items}

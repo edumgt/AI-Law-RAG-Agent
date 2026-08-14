@@ -10,8 +10,8 @@ variable "account_id" {
   default     = "086015456585"
 }
 
-variable "docdb_master_password" {
-  description = "DocumentDB master password (provide via TF_VAR_docdb_master_password)"
+variable "postgres_master_password" {
+  description = "PostgreSQL (RDS) master password (provide via TF_VAR_postgres_master_password)"
   type        = string
   sensitive   = true
 }

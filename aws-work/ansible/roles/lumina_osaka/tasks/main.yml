@@ -17,8 +17,8 @@
 - name: Launch dependency host
   ansible.builtin.import_tasks: ec2.yml
 
-- name: Create DocumentDB
-  ansible.builtin.import_tasks: docdb.yml
+- name: Create PostgreSQL
+  ansible.builtin.import_tasks: postgres.yml
 
 - name: Store runtime secrets
   ansible.builtin.import_tasks: secrets.yml

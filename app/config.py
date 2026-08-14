@@ -8,13 +8,9 @@ class Settings(BaseSettings):
     SESSION_TTL: int = 604800  # 7 days
 
     REDIS_URL: str = "redis://localhost:6379"
-    MONGO_URI: str = "mongodb://law_user:law_pass@localhost:27017/fin_agent?authSource=admin"
-    MONGO_DB: str = "fin_agent"
 
-    # ── Supabase (선택 – SUPABASE_URL 미설정 시 기능 비활성) ──────────────────
-    SUPABASE_URL: str = ""
-    SUPABASE_ANON_KEY: str = ""
-    SUPABASE_SERVICE_KEY: str = ""  # service_role 키 (RLS 우회)
+    # ── PostgreSQL (SQLAlchemy async + asyncpg) ───────────────────────────────
+    DATABASE_URL: str = "postgresql+asyncpg://lumina:lumina@localhost:5432/lumina"
 
     # ── JWT ──────────────────────────────────────────────────────────────────
     JWT_SECRET: str = "change-me-jwt-secret-32chars-min!!"

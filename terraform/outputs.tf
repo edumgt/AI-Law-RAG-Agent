@@ -12,9 +12,9 @@ output "alb_dns" {
   value       = aws_lb.main.dns_name
 }
 
-output "docdb_endpoint" {
-  description = "DocumentDB cluster endpoint"
-  value       = aws_docdb_cluster.main.endpoint
+output "postgres_endpoint" {
+  description = "PostgreSQL (RDS) instance endpoint"
+  value       = aws_db_instance.main.endpoint
 }
 
 output "ecr_lumina_invest" {

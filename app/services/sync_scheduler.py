@@ -2,7 +2,7 @@
 
 Runs an asyncio loop that wakes every SYNC_INTERVAL_SEC seconds.
 When the internet is reachable it fetches all external data sources
-and stores the results in MongoDB via data_cache so the app stays
+and stores the results in PostgreSQL via data_cache so the app stays
 functional when the network goes down.
 
 Start/stop is managed by main.py lifespan.

@@ -46,7 +46,6 @@ resource "aws_ecs_task_definition" "api" {
     }]
 
     environment = [
-      { name = "MONGO_DB",      value = "fin_agent" },
       { name = "TRUST_PROXY",   value = "true" },
       { name = "COOKIE_SECURE", value = "false" },
     ]
@@ -54,7 +53,7 @@ resource "aws_ecs_task_definition" "api" {
     secrets = [
       { name = "SESSION_SECRET",  valueFrom = "${aws_secretsmanager_secret.app.arn}:SESSION_SECRET::" },
       { name = "JWT_SECRET",      valueFrom = "${aws_secretsmanager_secret.app.arn}:JWT_SECRET::" },
-      { name = "MONGO_URI",       valueFrom = "${aws_secretsmanager_secret.app.arn}:MONGO_URI::" },
+      { name = "DATABASE_URL",    valueFrom = "${aws_secretsmanager_secret.app.arn}:DATABASE_URL::" },
       { name = "REDIS_URL",       valueFrom = "${aws_secretsmanager_secret.app.arn}:REDIS_URL::" },
       { name = "OLLAMA_BASE_URL", valueFrom = "${aws_secretsmanager_secret.app.arn}:OLLAMA_BASE_URL::" },
       { name = "QDRANT_URL",      valueFrom = "${aws_secretsmanager_secret.app.arn}:QDRANT_URL::" },
@@ -100,12 +99,8 @@ resource "aws_ecs_task_definition" "worker" {
     essential = true
     command   = ["celery", "-A", "app.celery_app", "worker", "--loglevel=info", "--concurrency=2", "--queues=celery"]
 
-    environment = [
-      { name = "MONGO_DB", value = "fin_agent" },
-    ]
-
     secrets = [
-      { name = "MONGO_URI",       valueFrom = "${aws_secretsmanager_secret.app.arn}:MONGO_URI::" },
+      { name = "DATABASE_URL",    valueFrom = "${aws_secretsmanager_secret.app.arn}:DATABASE_URL::" },
       { name = "REDIS_URL",       valueFrom = "${aws_secretsmanager_secret.app.arn}:REDIS_URL::" },
       { name = "OLLAMA_BASE_URL", valueFrom = "${aws_secretsmanager_secret.app.arn}:OLLAMA_BASE_URL::" },
       { name = "QDRANT_URL",      valueFrom = "${aws_secretsmanager_secret.app.arn}:QDRANT_URL::" },

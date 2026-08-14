@@ -1,10 +1,13 @@
-import json
 import logging
+import uuid
 import httpx
-from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field, ConfigDict
-from app.database.mongo import get_mdb
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database.postgres import get_pg_session
+from app.models import Portfolio, Order, BrokerSettings, CustomIndicator
 from app.lib.session import get_current_user
 from app.services.stock import (
     get_quote, get_candles, get_market_summary,
@@ -12,14 +15,23 @@ from app.services.stock import (
 )
 from app.services import auto_trade
 from app.services.quant_pipeline import backtest_custom_indicator
+from app.services.investment_research import backtest_strategy, screen_pattern
 from app.services.brokers.factory import get_broker_client
 from app.services.brokers.catalog import get_broker_catalog, get_broker_codes
 from app.services import notification
+from app.services.audit import audit
 from app.services.data_cache import cache_get, cache_set
 from app.services.sync_scheduler import KEY_MARKET_INDICES
 
 router = APIRouter(prefix="/api")
 DEFAULT_BROKER = "mock"
+
+
+def _uid(raw: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(raw)
+    except Exception:
+        raise HTTPException(400, "유효하지 않은 사용자 ID입니다.")
 
 
 @router.get("/stocks/market")
@@ -116,31 +128,25 @@ async def stock_signals(
     model: str = Query("lightgbm", description="lightgbm | rsi | ma | bollinger"),
     min_confidence: int = Query(65, ge=0, le=100),
 ):
-    """대표 종목 패턴 시그널 스크리닝."""
+    """선택한 패턴 모델을 적용한 대표 종목 스크리닝."""
     rows = []
     for stock in QUANT_STOCKS:
-        indicators = await get_quant_indicators(stock["symbol"], period="1y")
-        if indicators.get("error"):
+        candles = (await get_candles(stock["symbol"], period="1y", interval="1d")).get("candles", [])
+        result = screen_pattern(candles, model)
+        if result.get("error"):
             continue
         quote = await get_quote(stock["symbol"])
-        action = (indicators.get("signal") or {}).get("action", "관망")
-        score = float((indicators.get("signal") or {}).get("score", 0))
-        mapped = "HOLD"
-        if action in ("강력 매수", "매수"):
-            mapped = "BUY"
-        elif action in ("강력 매도", "매도"):
-            mapped = "SELL"
-        confidence = int(max(50, min(95, 50 + abs(score) * 12)))
         row = {
             "symbol": stock["symbol"],
             "name": stock["name"],
             "sector": stock.get("sector", ""),
             "model": model,
-            "signal": mapped,
-            "confidence": confidence,
-            "score": score,
-            "rsi": indicators.get("current_rsi"),
-            "price": quote.get("price") or indicators.get("current_price"),
+            "signal": result["signal"],
+            "confidence": result["confidence"],
+            "score": result["score"],
+            "reason": result["reason"],
+            "rsi": result["rsi"],
+            "price": quote.get("price") or result["price"],
             "change_pct": quote.get("change_pct"),
         }
         rows.append(row)
@@ -153,7 +159,7 @@ async def stock_signals(
     return {"signals": rows, "count": len(rows)}
 
 
-# ── 포트폴리오 (MongoDB) ──────────────────────────────────────────────
+# ── 포트폴리오 ─────────────────────────────────────────────────────────
 
 class HoldingBody(BaseModel):
     symbol: str
@@ -162,16 +168,22 @@ class HoldingBody(BaseModel):
     avg_price: float
 
 
+def _portfolio_to_dict(h: Portfolio) -> dict:
+    return {
+        "symbol": h.symbol, "name": h.name, "quantity": h.quantity,
+        "avg_price": h.avg_price, "updated_at": h.updated_at.isoformat(),
+    }
+
+
 @router.get("/portfolio")
 async def get_portfolio(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
-    cursor = mdb.portfolio.find({"user_id": user["id"]}).sort("updated_at", -1)
-    holdings = []
-    async for doc in cursor:
-        doc.pop("_id", None)
-        holdings.append(doc)
+    result = await db.execute(
+        select(Portfolio).where(Portfolio.user_id == _uid(user["id"])).order_by(Portfolio.updated_at.desc())
+    )
+    holdings = [_portfolio_to_dict(h) for h in result.scalars().all()]
     return {"holdings": holdings}
 
 
@@ -179,19 +191,18 @@ async def get_portfolio(
 async def upsert_holding(
     body: HoldingBody,
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
-    now = datetime.now(timezone.utc).isoformat()
-    await mdb.portfolio.update_one(
-        {"user_id": user["id"], "symbol": body.symbol},
-        {"$set": {
-            "name":       body.name,
-            "quantity":   body.quantity,
-            "avg_price":  body.avg_price,
-            "updated_at": now,
-        }, "$setOnInsert": {"created_at": now}},
-        upsert=True,
+    stmt = pg_insert(Portfolio).values(
+        user_id=_uid(user["id"]), symbol=body.symbol, name=body.name,
+        quantity=body.quantity, avg_price=body.avg_price,
     )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[Portfolio.user_id, Portfolio.symbol],
+        set_={"name": body.name, "quantity": body.quantity, "avg_price": body.avg_price},
+    )
+    await db.execute(stmt)
+    await db.commit()
     return {"ok": True}
 
 
@@ -199,13 +210,19 @@ async def upsert_holding(
 async def delete_holding(
     symbol: str,
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
-    await mdb.portfolio.delete_one({"user_id": user["id"], "symbol": symbol})
+    result = await db.execute(
+        select(Portfolio).where(Portfolio.user_id == _uid(user["id"]), Portfolio.symbol == symbol)
+    )
+    holding = result.scalar_one_or_none()
+    if holding:
+        await db.delete(holding)
+        await db.commit()
     return {"ok": True}
 
 
-# ── 수동 주문 (MongoDB) ───────────────────────────────────────────────
+# ── 수동 주문 ─────────────────────────────────────────────────────────
 
 class OrderBody(BaseModel):
     symbol: str
@@ -216,76 +233,67 @@ class OrderBody(BaseModel):
     broker: str = "virtual"
 
 
-async def _apply_portfolio(mdb, user_id: str, symbol: str, name: str,
+async def _apply_portfolio(db: AsyncSession, user_id: uuid.UUID, symbol: str, name: str,
                            order_type: str, quantity: int, price: float) -> None:
-    now = datetime.now(timezone.utc).isoformat()
+    """주문 체결분을 포트폴리오에 반영한다. 커밋은 호출자가 담당(주문 삽입과 한 트랜잭션)."""
+    result = await db.execute(
+        select(Portfolio).where(Portfolio.user_id == user_id, Portfolio.symbol == symbol)
+    )
+    existing = result.scalar_one_or_none()
+
     if order_type == "buy":
-        existing = await mdb.portfolio.find_one({"user_id": user_id, "symbol": symbol})
         if existing:
-            old_qty = existing["quantity"]
-            old_avg = existing["avg_price"]
-            new_qty = old_qty + quantity
-            new_avg = (old_avg * old_qty + price * quantity) / new_qty
-            await mdb.portfolio.update_one(
-                {"user_id": user_id, "symbol": symbol},
-                {"$set": {"quantity": new_qty, "avg_price": new_avg, "updated_at": now}},
-            )
+            new_qty = existing.quantity + quantity
+            existing.avg_price = (existing.avg_price * existing.quantity + price * quantity) / new_qty
+            existing.quantity = new_qty
         else:
-            await mdb.portfolio.insert_one({
-                "user_id": user_id, "symbol": symbol, "name": name,
-                "quantity": quantity, "avg_price": price,
-                "created_at": now, "updated_at": now,
-            })
-    elif order_type == "sell":
-        existing = await mdb.portfolio.find_one({"user_id": user_id, "symbol": symbol})
-        if existing:
-            new_qty = existing["quantity"] - quantity
-            if new_qty <= 0:
-                await mdb.portfolio.delete_one({"user_id": user_id, "symbol": symbol})
-            else:
-                await mdb.portfolio.update_one(
-                    {"user_id": user_id, "symbol": symbol},
-                    {"$set": {"quantity": new_qty, "updated_at": now}},
-                )
+            db.add(Portfolio(user_id=user_id, symbol=symbol, name=name, quantity=quantity, avg_price=price))
+    elif order_type == "sell" and existing:
+        new_qty = existing.quantity - quantity
+        if new_qty <= 0:
+            await db.delete(existing)
+        else:
+            existing.quantity = new_qty
 
 
 @router.post("/orders")
 async def place_order(
     body: OrderBody,
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
-    now = datetime.now(timezone.utc).isoformat()
-    await mdb.orders.insert_one({
-        "user_id":    user["id"],
-        "symbol":     body.symbol,
-        "name":       body.name,
-        "order_type": body.order_type,
-        "quantity":   body.quantity,
-        "price":      body.price,
-        "status":     "filled",
-        "broker":     body.broker,
-        "created_at": now,
-    })
-    await _apply_portfolio(mdb, user["id"], body.symbol, body.name,
+    uid = _uid(user["id"])
+    db.add(Order(
+        user_id=uid, symbol=body.symbol, name=body.name, order_type=body.order_type,
+        quantity=body.quantity, price=body.price, status="filled", broker=body.broker,
+    ))
+    await _apply_portfolio(db, uid, body.symbol, body.name,
                            body.order_type, body.quantity, body.price)
+    await db.commit()
+    await audit(user["id"], "", "order.manual", {
+        "symbol": body.symbol, "order_type": body.order_type,
+        "quantity": body.quantity, "price": body.price, "broker": body.broker,
+    })
     return {"ok": True, "status": "filled"}
 
 
 @router.get("/orders")
 async def order_history(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
-    cursor = mdb.orders.find({"user_id": user["id"]}).sort("created_at", -1).limit(200)
-    orders = []
-    async for doc in cursor:
-        doc.pop("_id", None)
-        orders.append(doc)
+    result = await db.execute(
+        select(Order).where(Order.user_id == _uid(user["id"])).order_by(Order.created_at.desc()).limit(200)
+    )
+    orders = [{
+        "symbol": o.symbol, "name": o.name, "order_type": o.order_type,
+        "quantity": o.quantity, "price": o.price, "status": o.status,
+        "broker": o.broker, "created_at": o.created_at.isoformat(),
+    } for o in result.scalars().all()]
     return {"orders": orders}
 
 
-# ── 증권사 API 설정 (MongoDB) ─────────────────────────────────────────
+# ── 증권사 API 설정 (PostgreSQL) ────────────────────────────────────────
 
 class BrokerSettingsBody(BaseModel):
     """브로커 설정 저장용 입력 모델.
@@ -323,6 +331,20 @@ class QuantSettingsBody(BaseModel):
     sell_ratio: float = Field(default=0.5, ge=0.1, le=1.0)
 
 
+async def _get_broker_settings_row(db: AsyncSession, user_id: uuid.UUID) -> BrokerSettings | None:
+    result = await db.execute(select(BrokerSettings).where(BrokerSettings.user_id == user_id))
+    return result.scalar_one_or_none()
+
+
+async def _get_or_create_broker_settings_row(db: AsyncSession, user_id: uuid.UUID) -> BrokerSettings:
+    row = await _get_broker_settings_row(db, user_id)
+    if row is None:
+        row = BrokerSettings(user_id=user_id)
+        db.add(row)
+        await db.flush()
+    return row
+
+
 @router.get("/broker/catalog")
 async def broker_catalog():
     return {"brokers": get_broker_catalog()}
@@ -332,36 +354,31 @@ async def broker_catalog():
 async def save_broker_settings(
     body: BrokerSettingsBody,
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     broker = (body.broker or DEFAULT_BROKER).strip().lower()
     if broker not in get_broker_codes():
         raise HTTPException(422, f"지원하지 않는 broker: {broker}")
 
-    now = datetime.now(timezone.utc).isoformat()
-    await mdb.broker_settings.update_one(
-        {"user_id": user["id"]},
-        {"$set": {
-            "broker":     broker,
-            "app_key":    body.app_key,
-            "app_secret": body.app_secret,
-            "account_no": body.account_no,
-            "paper":      body.paper,
-            "updated_at": now,
-        }},
-        upsert=True,
-    )
+    row = await _get_or_create_broker_settings_row(db, _uid(user["id"]))
+    row.broker = broker
+    row.app_key = body.app_key
+    row.app_secret = body.app_secret
+    row.account_no = body.account_no
+    row.paper = body.paper
+    await db.commit()
+    await audit(user["id"], "", "broker.settings.save", {"broker": broker, "paper": body.paper})
     return {"ok": True}
 
 
 @router.get("/broker/settings")
 async def get_broker_settings(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     catalog = get_broker_catalog()
-    doc = await mdb.broker_settings.find_one({"user_id": user["id"]})
-    if not doc:
+    row = await _get_broker_settings_row(db, _uid(user["id"]))
+    if not row:
         return {
             "broker": DEFAULT_BROKER,
             "connected": False,
@@ -369,14 +386,13 @@ async def get_broker_settings(
             "paper": True,
             "brokers": catalog,
         }
-    key = doc.get("app_key", "")
-    masked = key[:4] + "****" if key else ""
+    masked = row.app_key[:4] + "****" if row.app_key else ""
     return {
-        "broker":     doc.get("broker", DEFAULT_BROKER),
-        "connected":  bool(key),
+        "broker":     row.broker,
+        "connected":  bool(row.app_key),
         "app_key":    masked,
-        "account_no": doc.get("account_no", ""),
-        "paper":      doc.get("paper", True),
+        "account_no": row.account_no,
+        "paper":      row.paper,
         "brokers": catalog,
     }
 
@@ -384,41 +400,36 @@ async def get_broker_settings(
 @router.get("/quant/settings")
 async def get_quant_settings(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     catalog = get_broker_catalog()
     stocks = QUANT_STOCKS
-    doc = await mdb.broker_settings.find_one({"user_id": user["id"]}) or {}
-    selected = doc.get("quant_selected_symbols", [])
-    if not isinstance(selected, list):
-        selected = []
+    row = await _get_broker_settings_row(db, _uid(user["id"]))
+    if not row:
+        return {
+            "mode": "paper", "broker": DEFAULT_BROKER, "connected": False, "app_key": "",
+            "account_no": "", "paper": True, "symbol_source": "ai", "selected_symbols": [],
+            "ai_top_n": 3, "per_trade_budget": 1_000_000.0, "buy_ratio": 1.0, "sell_ratio": 0.5,
+            "brokers": catalog, "stocks": stocks,
+        }
 
-    mode = "paper"
-    if doc.get("quant_mode") in ("paper", "live"):
-        mode = doc["quant_mode"]
-    elif doc.get("paper") is False:
-        mode = "live"
-
-    source = doc.get("quant_symbol_source", "ai")
-    if source not in ("ai", "manual"):
-        source = "ai"
-
-    key = doc.get("app_key", "")
-    masked = key[:4] + "****" if key else ""
+    mode = row.quant_mode if row.quant_mode in ("paper", "live") else ("live" if row.paper is False else "paper")
+    source = row.quant_symbol_source if row.quant_symbol_source in ("ai", "manual") else "ai"
+    masked = row.app_key[:4] + "****" if row.app_key else ""
 
     return {
         "mode": mode,
-        "broker": doc.get("broker", DEFAULT_BROKER),
-        "connected": bool(key),
+        "broker": row.broker,
+        "connected": bool(row.app_key),
         "app_key": masked,
-        "account_no": doc.get("account_no", ""),
+        "account_no": row.account_no,
         "paper": mode == "paper",
         "symbol_source": source,
-        "selected_symbols": selected,
-        "ai_top_n": int(doc.get("quant_ai_top_n", 3)),
-        "per_trade_budget": float(doc.get("quant_per_trade_budget", 1_000_000)),
-        "buy_ratio": float(doc.get("quant_buy_ratio", 1.0)),
-        "sell_ratio": float(doc.get("quant_sell_ratio", 0.5)),
+        "selected_symbols": list(row.quant_selected_symbols or []),
+        "ai_top_n": row.quant_ai_top_n,
+        "per_trade_budget": row.quant_per_trade_budget,
+        "buy_ratio": row.quant_buy_ratio,
+        "sell_ratio": row.quant_sell_ratio,
         "brokers": catalog,
         "stocks": stocks,
     }
@@ -428,7 +439,7 @@ async def get_quant_settings(
 async def save_quant_settings(
     body: QuantSettingsBody,
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     broker = (body.broker or DEFAULT_BROKER).strip().lower()
     if broker not in get_broker_codes():
@@ -445,38 +456,35 @@ async def save_quant_settings(
     valid_symbols = {s["symbol"] for s in QUANT_STOCKS}
     selected = [s for s in (body.selected_symbols or []) if s in valid_symbols]
 
-    now = datetime.now(timezone.utc).isoformat()
-    await mdb.broker_settings.update_one(
-        {"user_id": user["id"]},
-        {"$set": {
-            "broker": broker,
-            "app_key": body.app_key,
-            "app_secret": body.app_secret,
-            "account_no": body.account_no,
-            "paper": mode == "paper",
-            "quant_mode": mode,
-            "quant_symbol_source": symbol_source,
-            "quant_selected_symbols": selected,
-            "quant_ai_top_n": body.ai_top_n,
-            "quant_per_trade_budget": body.per_trade_budget,
-            "quant_buy_ratio": body.buy_ratio,
-            "quant_sell_ratio": body.sell_ratio,
-            "updated_at": now,
-        }},
-        upsert=True,
-    )
+    row = await _get_or_create_broker_settings_row(db, _uid(user["id"]))
+    row.broker = broker
+    row.app_key = body.app_key
+    row.app_secret = body.app_secret
+    row.account_no = body.account_no
+    row.paper = mode == "paper"
+    row.quant_mode = mode
+    row.quant_symbol_source = symbol_source
+    row.quant_selected_symbols = selected
+    row.quant_ai_top_n = body.ai_top_n
+    row.quant_per_trade_budget = body.per_trade_budget
+    row.quant_buy_ratio = body.buy_ratio
+    row.quant_sell_ratio = body.sell_ratio
+    await db.commit()
+    await audit(user["id"], "", "quant.settings.save", {
+        "broker": broker, "mode": mode, "symbol_source": symbol_source,
+    })
     return {"ok": True}
 
 
-async def _get_broker_client(user: dict, mdb):
-    doc = await mdb.broker_settings.find_one({"user_id": user["id"]})
-    if not doc:
+async def _get_broker_client(user: dict, db: AsyncSession):
+    row = await _get_broker_settings_row(db, _uid(user["id"]))
+    if not row:
         return get_broker_client("mock")
     return get_broker_client(
-        broker     = doc.get("broker", "mock"),
-        app_key    = doc.get("app_key", ""),
-        app_secret = doc.get("app_secret", ""),
-        paper      = doc.get("paper", True),
+        broker     = row.broker or "mock",
+        app_key    = row.app_key,
+        app_secret = row.app_secret,
+        paper      = row.paper,
     )
 
 
@@ -486,9 +494,9 @@ async def _get_broker_client(user: dict, mdb):
 async def broker_price(
     symbol: str = Query(...),
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
-    client = await _get_broker_client(user, mdb)
+    client = await _get_broker_client(user, db)
     try:
         info = await client.get_price(symbol)
         return {
@@ -504,11 +512,11 @@ async def broker_price(
 @router.get("/broker/balance")
 async def broker_balance(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
-    client = await _get_broker_client(user, mdb)
-    doc = await mdb.broker_settings.find_one({"user_id": user["id"]}) or {}
-    account_no = doc.get("account_no", "")
+    client = await _get_broker_client(user, db)
+    row = await _get_broker_settings_row(db, _uid(user["id"]))
+    account_no = row.account_no if row else ""
     try:
         bal = await client.get_balance(account_no)
         return {
@@ -533,9 +541,9 @@ async def broker_ohlcv(
     start: str = Query(...),
     end: str = Query(...),
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
-    client = await _get_broker_client(user, mdb)
+    client = await _get_broker_client(user, db)
     try:
         rows = await client.get_daily_ohlcv(symbol, start, end)
         return {"candles": rows}
@@ -554,11 +562,12 @@ class BrokerOrderBody(BaseModel):
 async def broker_order(
     body: BrokerOrderBody,
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
-    client = await _get_broker_client(user, mdb)
-    doc = await mdb.broker_settings.find_one({"user_id": user["id"]}) or {}
-    account_no = doc.get("account_no", "")
+    client = await _get_broker_client(user, db)
+    row = await _get_broker_settings_row(db, _uid(user["id"]))
+    account_no = row.account_no if row else ""
+    broker_name = row.broker if row else "mock"
 
     # ── 매수 주문 시 예수금 사전 확인 ──────────────────────────────────────
     if body.side == "buy":
@@ -597,6 +606,10 @@ async def broker_order(
             price    = body.price,
             user_id  = user["id"],
         )
+        await audit(user["id"], "", "order.broker", {
+            "broker": broker_name, "symbol": body.symbol,
+            "side": body.side, "quantity": body.quantity, "price": body.price,
+        })
         return {"ok": True, "result": result}
     except Exception as e:
         await notification.notify_order_error(
@@ -607,16 +620,20 @@ async def broker_order(
             error    = str(e),
             user_id  = user["id"],
         )
+        await audit(user["id"], "", "order.broker.error", {
+            "broker": broker_name, "symbol": body.symbol,
+            "side": body.side, "error": str(e),
+        })
         raise HTTPException(502, f"증권사 API 주문 오류: {e}")
 
 
 @router.get("/broker/test")
 async def broker_test(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     """증권사 연결 테스트용 간단 시세 조회."""
-    client = await _get_broker_client(user, mdb)
+    client = await _get_broker_client(user, db)
     try:
         info = await client.get_price("005930.KS")
         return {"ok": True, "broker_price": {"symbol": info.symbol, "current": info.current}}
@@ -659,23 +676,42 @@ async def quant_auto_stop(user=Depends(get_current_user)):
 
 @router.get("/quant/auto/status")
 async def quant_auto_status(user=Depends(get_current_user)):
-    """기존 프론트 호환 경로."""
-    return {
-        "running": auto_trade.is_running(),
-        "logs": [],
-        "signals": [],
-        "message": "자동매매 상세 로그는 /api/auto-trade/status에서 확인하세요.",
-    }
+    """모의 투자 의사결정 UI용 최근 사이클 결과."""
+    status = auto_trade.get_status()
+    logs, signals = [], []
+    for cycle in status.get("log", [])[-10:]:
+        for sig in cycle.get("signals", []):
+            action = sig.get("action", "관망")
+            signals.append({
+                **sig,
+                "signal": "BUY" if "매수" in action else "SELL" if "매도" in action else "HOLD",
+            })
+        account = cycle.get("account")
+        if account:
+            logs.append({
+                "time": cycle.get("time", ""),
+                "message": f"모의계좌 평가 {account.get('total_equity', 0):,.0f}원 / 손익 {account.get('pnl_pct', 0):+.2f}%",
+            })
+        for trade in cycle.get("trades", []):
+            logs.append({
+                "time": trade.get("time", cycle.get("time", "")),
+                "message": f"{trade.get('name', trade.get('symbol', ''))} {trade.get('action', '').upper()} "
+                           f"{trade.get('quantity', 0)}주 — {trade.get('reason', '')}",
+            })
+    return {"running": status["running"], "logs": logs[-50:], "signals": signals[-20:]}
 
 
 @router.get("/quant/pipeline")
 async def quant_pipeline_indicator_backtest(
     symbol: str = Query("005930.KS"),
     period: str = Query("10y"),
+    base: str = Query("rsi_ma", description="rsi_ma | macd_bb | volume_rsi | triple_ma"),
     short: int = Query(5, ge=2, le=30),
     mid: int = Query(20, ge=3, le=120),
     rsi: int = Query(14, ge=5, le=40),
     buy_th: float = Query(35.0, ge=5.0, le=50.0),
+    strategy: str = Query("custom", description="custom | rsi | ma | bollinger | composite"),
+    cost_bps: float = Query(10.0, ge=0.0, le=500.0),
     _user=Depends(get_current_user),
 ):
     """커스텀 인디케이터 실백테스트."""
@@ -683,15 +719,98 @@ async def quant_pipeline_indicator_backtest(
     candles = candle_data.get("candles", [])
     if not candles:
         raise HTTPException(404, f"종목 데이터 없음: {symbol}")
-    result = backtest_custom_indicator(
-        candles=candles,
-        short_window=short,
-        mid_window=mid,
-        rsi_period=rsi,
-        buy_threshold=buy_th,
-    )
+    if strategy != "custom":
+        if strategy not in ("rsi", "ma", "bollinger", "composite"):
+            raise HTTPException(422, "strategy는 custom, rsi, ma, bollinger, composite 중 하나여야 합니다.")
+        result = backtest_strategy(candles, strategy=strategy, cost_bps=cost_bps)
+    else:
+        result = backtest_custom_indicator(
+            candles=candles, base=base, short_window=short, mid_window=mid,
+            rsi_period=rsi, buy_threshold=buy_th,
+        )
     if "error" in result:
         raise HTTPException(422, result["error"])
     result["symbol"] = symbol
     result["period"] = period
     return result
+
+
+# ── 커스텀 인디케이터 저장/불러오기 ────────────────────────────────────
+
+class CustomIndicatorBody(BaseModel):
+    name:          str = Field(..., min_length=1, max_length=60)
+    base:          str = Field("rsi_ma", description="rsi_ma | macd_bb | volume_rsi | triple_ma")
+    short_window:  int = Field(5,  ge=2,  le=30)
+    mid_window:    int = Field(20, ge=3,  le=120)
+    rsi_period:    int = Field(14, ge=5,  le=40)
+    buy_threshold: float = Field(35.0, ge=5.0, le=50.0)
+
+
+def _oid(raw: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(raw)
+    except Exception:
+        raise HTTPException(400, "유효하지 않은 ID입니다.")
+
+
+def _custom_indicator_to_dict(row: CustomIndicator) -> dict:
+    return {
+        "id": str(row.id), "name": row.name, "base": row.base,
+        "short_window": row.short_window, "mid_window": row.mid_window,
+        "rsi_period": row.rsi_period, "buy_threshold": row.buy_threshold,
+        "created_at": row.created_at.isoformat(),
+    }
+
+
+@router.get("/custom-indicators")
+async def list_custom_indicators(
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_pg_session),
+):
+    """내가 저장한 커스텀 인디케이터 목록."""
+    result = await db.execute(
+        select(CustomIndicator)
+        .where(CustomIndicator.user_id == _uid(user["id"]))
+        .order_by(CustomIndicator.created_at.desc())
+    )
+    items = [_custom_indicator_to_dict(row) for row in result.scalars().all()]
+    return {"items": items}
+
+
+@router.post("/custom-indicators")
+async def save_custom_indicator(
+    body: CustomIndicatorBody,
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_pg_session),
+):
+    """커스텀 인디케이터 파라미터 조합을 저장."""
+    if body.base not in ("rsi_ma", "macd_bb", "volume_rsi", "triple_ma"):
+        raise HTTPException(422, "base는 rsi_ma, macd_bb, volume_rsi, triple_ma 중 하나여야 합니다.")
+    row = CustomIndicator(
+        user_id=_uid(user["id"]), name=body.name, base=body.base,
+        short_window=body.short_window, mid_window=body.mid_window,
+        rsi_period=body.rsi_period, buy_threshold=body.buy_threshold,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return _custom_indicator_to_dict(row)
+
+
+@router.delete("/custom-indicators/{indicator_id}")
+async def delete_custom_indicator(
+    indicator_id: str,
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_pg_session),
+):
+    result = await db.execute(
+        select(CustomIndicator).where(
+            CustomIndicator.id == _oid(indicator_id), CustomIndicator.user_id == _uid(user["id"])
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "저장된 인디케이터를 찾을 수 없습니다.")
+    await db.delete(row)
+    await db.commit()
+    return {"ok": True}

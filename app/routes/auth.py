@@ -18,14 +18,16 @@ JWT 방식 (API 클라이언트 / 모바일):
   DELETE /api/sessions/{sid} – 특정 세션 강제 만료
 """
 import uuid
-from datetime import datetime, timezone
 
 import bcrypt
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.config import settings
-from app.database.mongo import get_mongo_db
+from app.database.postgres import get_session_factory
+from app.models import User
 from app.lib.jwt_auth import (
     create_token_pair,
     decode_token,
@@ -45,10 +47,6 @@ from app.lib.session import (
 from app.lib.user_state import clear_user_state, mark_offline, mark_online
 
 router = APIRouter(prefix="/api")
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 # ── 요청/응답 스키마 ───────────────────────────────────────────────────────────
@@ -85,11 +83,21 @@ def _build_session_data(user_id: str, user: dict) -> dict:
     }
 
 
-async def _find_user_by_email(db, email: str):
+async def _find_user_by_email(db, email: str) -> User | None:
     try:
-        return await db.users.find_one({"email": email})
+        result = await db.execute(select(User).where(User.email == email))
+        return result.scalar_one_or_none()
     except Exception as e:
         raise HTTPException(503, f"데이터베이스 오류: {e}")
+
+
+def _user_to_dict(user: User) -> dict:
+    return {
+        "name": user.name,
+        "email": user.email,
+        "client_id": user.client_id,
+        "roles": list(user.roles),
+    }
 
 
 # ── 쿠키 기반 인증 ─────────────────────────────────────────────────────────────
@@ -97,28 +105,30 @@ async def _find_user_by_email(db, email: str):
 @router.post("/auth/register")
 async def register(body: RegisterBody, response: Response):
     try:
-        db = get_mongo_db()
+        session_factory = get_session_factory()
     except RuntimeError:
-        raise HTTPException(503, "인증 서버(MongoDB)에 연결할 수 없습니다.")
-    if await db.users.find_one({"email": body.email}):
-        raise HTTPException(400, "이미 사용 중인 이메일입니다.")
+        raise HTTPException(503, "인증 서버(PostgreSQL)에 연결할 수 없습니다.")
 
     pw_hash = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
     client_id = str(uuid.uuid4()).replace("-", "")[:16].upper()
     roles = ["admin"] if body.email in settings.admin_email_list else ["user"]
 
-    user_doc = {
-        "name": body.name,
-        "email": body.email,
-        "password_hash": pw_hash,
-        "client_id": client_id,
-        "roles": roles,
-        "created_at": _now(),
-    }
-    result = await db.users.insert_one(user_doc)
-    user_id = str(result.inserted_id)
+    async with session_factory() as db:
+        user = User(
+            name=body.name, email=body.email, password_hash=pw_hash,
+            client_id=client_id, roles=roles,
+        )
+        db.add(user)
+        try:
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            raise HTTPException(400, "이미 사용 중인 이메일입니다.")
+        user_id = str(user.id)
 
-    session_data = _build_session_data(user_id, {**user_doc, "client_id": client_id})
+    session_data = _build_session_data(user_id, {
+        "name": body.name, "email": body.email, "client_id": client_id, "roles": roles,
+    })
     sid = await create_session(session_data)
     await mark_online(user_id)
 
@@ -134,16 +144,18 @@ async def register(body: RegisterBody, response: Response):
 @router.post("/auth/login")
 async def login(body: LoginBody, response: Response):
     try:
-        db = get_mongo_db()
+        session_factory = get_session_factory()
     except RuntimeError:
-        raise HTTPException(503, "인증 서버(MongoDB)에 연결할 수 없습니다.")
+        raise HTTPException(503, "인증 서버(PostgreSQL)에 연결할 수 없습니다.")
 
-    user = await _find_user_by_email(db, body.email)
-    if not user or not bcrypt.checkpw(body.password.encode(), user["password_hash"].encode()):
-        raise HTTPException(401, "이메일 또는 비밀번호가 올바르지 않습니다.")
+    async with session_factory() as db:
+        user = await _find_user_by_email(db, body.email)
+        if not user or not bcrypt.checkpw(body.password.encode(), user.password_hash.encode()):
+            raise HTTPException(401, "이메일 또는 비밀번호가 올바르지 않습니다.")
+        user_id = str(user.id)
+        user_dict = _user_to_dict(user)
 
-    user_id = str(user["_id"])
-    session_data = _build_session_data(user_id, user)
+    session_data = _build_session_data(user_id, user_dict)
     sid = await create_session(session_data)
     await mark_online(user_id)
 
@@ -152,9 +164,9 @@ async def login(body: LoginBody, response: Response):
         httponly=True, samesite=settings.COOKIE_SAMESITE,
         secure=settings.COOKIE_SECURE, max_age=settings.SESSION_TTL,
     )
-    return {"ok": True, "user": {"name": user["name"], "email": user["email"],
-                                  "clientId": user.get("client_id", ""),
-                                  "roles": user.get("roles", ["user"])}}
+    return {"ok": True, "user": {"name": user_dict["name"], "email": user_dict["email"],
+                                  "clientId": user_dict["client_id"],
+                                  "roles": user_dict["roles"]}}
 
 
 @router.post("/auth/logout")
@@ -176,22 +188,24 @@ async def logout(
 async def issue_token(body: LoginBody):
     """JWT 액세스/리프레시 토큰을 발급합니다 (API 클라이언트용)."""
     try:
-        db = get_mongo_db()
+        session_factory = get_session_factory()
     except RuntimeError:
-        raise HTTPException(503, "인증 서버(MongoDB)에 연결할 수 없습니다.")
+        raise HTTPException(503, "인증 서버(PostgreSQL)에 연결할 수 없습니다.")
 
-    user = await _find_user_by_email(db, body.email)
-    if not user or not bcrypt.checkpw(body.password.encode(), user["password_hash"].encode()):
-        raise HTTPException(401, "이메일 또는 비밀번호가 올바르지 않습니다.")
+    async with session_factory() as db:
+        user = await _find_user_by_email(db, body.email)
+        if not user or not bcrypt.checkpw(body.password.encode(), user.password_hash.encode()):
+            raise HTTPException(401, "이메일 또는 비밀번호가 올바르지 않습니다.")
+        user_id = str(user.id)
+        user_dict = _user_to_dict(user)
 
-    user_id = str(user["_id"])
     payload = {
         "sub": user_id,
         "id": user_id,
-        "name": user["name"],
-        "email": user["email"],
-        "client_id": user.get("client_id", ""),
-        "roles": user.get("roles", ["user"]),
+        "name": user_dict["name"],
+        "email": user_dict["email"],
+        "client_id": user_dict["client_id"],
+        "roles": user_dict["roles"],
     }
     await mark_online(user_id)
     return create_token_pair(payload)

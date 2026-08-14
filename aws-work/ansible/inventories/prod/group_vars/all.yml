@@ -23,7 +23,7 @@ lumina_subnet_ids:
   alb:
     - subnet-0b7dcd7ba9c6836c0
     - subnet-REPLACE-WITH-SECOND-PUBLIC-SUBNET
-  docdb:
+  postgres:
     - subnet-0d28ba1be9a1ff04c
     - subnet-0e0cd6292f59623af
     - subnet-084bfb82b09ef14e1
@@ -35,9 +35,9 @@ lumina_security_groups:
   ecs:
     name: lumina-ecs-sg
     id: sg-0baee9bc5a2ea90b0
-  docdb:
-    name: lumina-docdb-sg
-    id: sg-02cd84bcccf1eb18f
+  postgres:
+    name: lumina-postgres-sg
+    id: sg-REPLACE-WITH-POSTGRES-SG-ID  # 신규 RDS Postgres SG. 이전 DocumentDB SG였던 sg-02cd84bcccf1eb18f 는 더 이상 사용하지 않음
   dependencies:
     name: launch-wizard-1
     id: sg-0dc3ec23151b1ce26
@@ -152,8 +152,6 @@ lumina_ecs:
           - containerPort: 8000
             protocol: tcp
         environment:
-          - name: MONGO_DB
-            value: fin_agent
           - name: TRUST_PROXY
             value: "true"
           - name: COOKIE_SECURE
@@ -163,8 +161,8 @@ lumina_ecs:
             valueFrom: "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:SESSION_SECRET::"
           - name: JWT_SECRET
             valueFrom: "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:JWT_SECRET::"
-          - name: MONGO_URI
-            valueFrom: "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:MONGO_URI::"
+          - name: DATABASE_URL
+            valueFrom: "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:DATABASE_URL::"
           - name: REDIS_URL
             valueFrom: "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:REDIS_URL::"
           - name: OLLAMA_BASE_URL
@@ -212,12 +210,9 @@ lumina_ecs:
           - --loglevel=info
           - --concurrency=2
           - --queues=celery
-        environment:
-          - name: MONGO_DB
-            value: fin_agent
         secrets:
-          - name: MONGO_URI
-            valueFrom: "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:MONGO_URI::"
+          - name: DATABASE_URL
+            valueFrom: "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:DATABASE_URL::"
           - name: REDIS_URL
             valueFrom: "arn:aws:secretsmanager:ap-northeast-2:086015456585:secret:lumina-invest/prod/app-c4WE2y:REDIS_URL::"
           - name: OLLAMA_BASE_URL

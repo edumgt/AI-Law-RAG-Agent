@@ -16,7 +16,7 @@ from typing import Any
 from app.services.quant_pipeline import preprocess, feature_engineer, FEATURE_COLS
 
 try:
-    from sklearn.linear_model import LinearRegression, Ridge, Lasso
+    from sklearn.linear_model import LinearRegression, Ridge, Lasso, LogisticRegression
     from sklearn.svm import SVR, SVC
     from sklearn.ensemble import (
         RandomForestClassifier, GradientBoostingClassifier, VotingClassifier,
@@ -88,6 +88,10 @@ def compare_models(candles: list[dict]) -> dict:
             ("gb",  GradientBoostingClassifier(n_estimators=50, random_state=42)),
             ("mlp", MLPClassifier(hidden_layer_sizes=(32,), max_iter=200, random_state=42, verbose=False)),
         ], voting="hard"),
+        "Ensemble(Stacking)": StackingClassifier(estimators=[
+            ("rf", RandomForestClassifier(n_estimators=50, random_state=42)),
+            ("gb", GradientBoostingClassifier(n_estimators=50, random_state=42)),
+        ], final_estimator=LogisticRegression(max_iter=1000), cv=3),
     }
     if HAS_LGB:
         classifiers["LightGBM"] = None  # handled separately
@@ -247,6 +251,12 @@ def cluster_stocks(stocks_data: list[dict]) -> dict:
 
     sil = float(silhouette_score(X_s, labels)) if len(set(labels)) > 1 else 0.0
 
+    # DBSCAN: 밀도 기반으로 어느 군집에도 속하지 않는 이상치 종목 탐지 (군집 수 자동)
+    dbscan = DBSCAN(eps=1.5, min_samples=2)
+    dbscan_labels = dbscan.fit_predict(X_s)
+    dbscan_outliers = [sym for sym, lab in zip(symbols, dbscan_labels) if lab == -1]
+    dbscan_n_clusters = len({lab for lab in dbscan_labels if lab != -1})
+
     cluster_items = []
     for sym, lab, feat in zip(symbols, labels, rows):
         cluster_items.append({
@@ -273,6 +283,11 @@ def cluster_stocks(stocks_data: list[dict]) -> dict:
         "silhouette_score": round(sil, 4),
         "clusters":         cluster_items,
         "summary":          cluster_summary,
+        "dbscan": {
+            "n_clusters": dbscan_n_clusters,
+            "outliers":   dbscan_outliers,
+            "note":       "밀도 기반 탐지 — 다른 종목과 패턴이 크게 다른 이상치 종목",
+        },
     }
 
 

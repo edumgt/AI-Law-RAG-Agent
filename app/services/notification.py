@@ -220,14 +220,43 @@ async def send_sms(
 
 
 async def _load_user_settings(user_id: str | None) -> dict:
-    """MongoDB에서 사용자별 알림 설정을 조회한다."""
+    """PostgreSQL에서 사용자별 알림 설정을 조회한다."""
     if not user_id:
         return {}
     try:
-        from app.database.mongo import get_mongo_db  # noqa: PLC0415 – lazy import to avoid circular
-        mdb = get_mongo_db()
-        doc = await mdb.notification_settings.find_one({"user_id": user_id})
-        return doc or {}
+        import uuid
+        from sqlalchemy import select
+        from app.database.postgres import get_session_factory  # noqa: PLC0415 – lazy import to avoid circular
+        from app.models import NotificationSettings  # noqa: PLC0415
+
+        session_factory = get_session_factory()
+        async with session_factory() as db:
+            result = await db.execute(
+                select(NotificationSettings).where(NotificationSettings.user_id == uuid.UUID(user_id))
+            )
+            row = result.scalar_one_or_none()
+        if not row:
+            return {}
+        return {
+            "channels": row.channels,
+            "telegram_token": row.telegram_token,
+            "telegram_chat_id": row.telegram_chat_id,
+            "slack_webhook_url": row.slack_webhook_url,
+            "email_to": row.email_to,
+            "email_host": row.email_host,
+            "email_port": row.email_port,
+            "email_user": row.email_user,
+            "email_password": row.email_password,
+            "email_from": row.email_from,
+            "kakao_api_key": row.kakao_api_key,
+            "kakao_api_secret": row.kakao_api_secret,
+            "kakao_sender_key": row.kakao_sender_key,
+            "kakao_phone": row.kakao_phone,
+            "sms_api_key": row.sms_api_key,
+            "sms_api_secret": row.sms_api_secret,
+            "sms_from": row.sms_from,
+            "sms_to": row.sms_to,
+        }
     except Exception:
         return {}
 
@@ -269,19 +298,23 @@ async def dispatch(
     plain = message
     subj  = subject or f"[매매 알림] {plain[:40]}"
 
-    tasks = []
+    tasks: list = []
+    channel_names: list[str] = []
     if "telegram" in channels:
+        channel_names.append("telegram")
         tasks.append(send_telegram(
             html,
             token=user_cfg.get("telegram_token", ""),
             chat_id=user_cfg.get("telegram_chat_id", ""),
         ))
     if "slack" in channels:
+        channel_names.append("slack")
         tasks.append(send_slack(
             plain,
             webhook_url=user_cfg.get("slack_webhook_url", ""),
         ))
     if "email" in channels:
+        channel_names.append("email")
         tasks.append(send_email(
             subject=subj,
             body=html,
@@ -293,6 +326,7 @@ async def dispatch(
             from_addr=user_cfg.get("email_from", ""),
         ))
     if "kakao" in channels:
+        channel_names.append("kakao")
         tasks.append(send_kakao(
             plain,
             api_key=user_cfg.get("kakao_api_key", ""),
@@ -301,6 +335,7 @@ async def dispatch(
             phone=user_cfg.get("kakao_phone", ""),
         ))
     if "sms" in channels:
+        channel_names.append("sms")
         tasks.append(send_sms(
             plain,
             api_key=user_cfg.get("sms_api_key", ""),
@@ -309,8 +344,46 @@ async def dispatch(
             to_no=user_cfg.get("sms_to", ""),
         ))
 
+    results: list = []
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    await _log_dispatch(user_id, subj, plain, channel_names, results)
+
+
+async def _log_dispatch(
+    user_id: str | None,
+    subject: str,
+    message: str,
+    channel_names: list[str],
+    results: list,
+) -> None:
+    """발송 시도를 notification_log 테이블에 남긴다 (알림 이력 조회용)."""
+    try:
+        import uuid
+        from app.database.postgres import get_session_factory  # noqa: PLC0415 – lazy import to avoid circular
+        from app.models import NotificationLog  # noqa: PLC0415
+
+        resolved_user_id = None
+        if user_id:
+            try:
+                resolved_user_id = uuid.UUID(user_id)
+            except ValueError:
+                resolved_user_id = None
+
+        session_factory = get_session_factory()
+        async with session_factory() as db:
+            db.add(NotificationLog(
+                user_id=resolved_user_id,
+                subject=subject,
+                message=message[:500],
+                channels=[
+                    {"channel": name, "ok": bool(r is True)}
+                    for name, r in zip(channel_names, results)
+                ],
+            ))
+            await db.commit()
+    except Exception:
+        pass  # 이력 기록 실패는 알림 발송 자체를 막지 않음
 
 
 # ── 알림 헬퍼 ────────────────────────────────────────────────────────────────

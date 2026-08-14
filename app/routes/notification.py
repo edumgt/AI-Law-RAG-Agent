@@ -4,13 +4,16 @@ GET  /api/notification/settings  – 현재 사용자의 알림 설정 조회
 POST /api/notification/settings  – 알림 설정 저장
 POST /api/notification/test      – 테스트 알림 전송
 """
-from datetime import datetime, timezone
+import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.mongo import get_mdb
+from app.database.postgres import get_pg_session
 from app.lib.session import get_current_user
+from app.models import NotificationLog, NotificationSettings
 from app.services import notification
 
 router = APIRouter(prefix="/api/notification")
@@ -51,37 +54,51 @@ class NotificationSettingsBody(BaseModel):
     sms_to: str = ""
 
 
+async def _get_settings_row(db: AsyncSession, user_id: uuid.UUID) -> NotificationSettings | None:
+    result = await db.execute(select(NotificationSettings).where(NotificationSettings.user_id == user_id))
+    return result.scalar_one_or_none()
+
+
 @router.get("/settings")
 async def get_notification_settings(
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     """현재 사용자의 알림 설정을 반환한다. 비밀값(password/secret)은 마스킹."""
-    doc = await mdb.notification_settings.find_one({"user_id": user["id"]}) or {}
+    row = await _get_settings_row(db, uuid.UUID(user["id"]))
 
     def mask(v: str) -> str:
         """보안을 위해 비밀값은 설정 여부만 알 수 있도록 고정 마스크로 반환."""
         return "****" if v else ""
 
+    if not row:
+        return {
+            "channels": [], "telegram_token": "", "telegram_chat_id": "",
+            "slack_webhook_url": "", "email_to": "", "email_host": "",
+            "email_port": 587, "email_user": "", "email_password": "", "email_from": "",
+            "kakao_api_key": "", "kakao_api_secret": "", "kakao_sender_key": "", "kakao_phone": "",
+            "sms_api_key": "", "sms_api_secret": "", "sms_from": "", "sms_to": "",
+        }
+
     return {
-        "channels":          doc.get("channels", []),
-        "telegram_token":    mask(doc.get("telegram_token", "")),
-        "telegram_chat_id":  doc.get("telegram_chat_id", ""),
-        "slack_webhook_url": doc.get("slack_webhook_url", ""),
-        "email_to":          doc.get("email_to", ""),
-        "email_host":        doc.get("email_host", ""),
-        "email_port":        doc.get("email_port", 587),
-        "email_user":        doc.get("email_user", ""),
-        "email_password":    mask(doc.get("email_password", "")),
-        "email_from":        doc.get("email_from", ""),
-        "kakao_api_key":     mask(doc.get("kakao_api_key", "")),
-        "kakao_api_secret":  mask(doc.get("kakao_api_secret", "")),
-        "kakao_sender_key":  doc.get("kakao_sender_key", ""),
-        "kakao_phone":       doc.get("kakao_phone", ""),
-        "sms_api_key":       mask(doc.get("sms_api_key", "")),
-        "sms_api_secret":    mask(doc.get("sms_api_secret", "")),
-        "sms_from":          doc.get("sms_from", ""),
-        "sms_to":            doc.get("sms_to", ""),
+        "channels":          row.channels,
+        "telegram_token":    mask(row.telegram_token),
+        "telegram_chat_id":  row.telegram_chat_id,
+        "slack_webhook_url": row.slack_webhook_url,
+        "email_to":          row.email_to,
+        "email_host":        row.email_host,
+        "email_port":        row.email_port,
+        "email_user":        row.email_user,
+        "email_password":    mask(row.email_password),
+        "email_from":        row.email_from,
+        "kakao_api_key":     mask(row.kakao_api_key),
+        "kakao_api_secret":  mask(row.kakao_api_secret),
+        "kakao_sender_key":  row.kakao_sender_key,
+        "kakao_phone":       row.kakao_phone,
+        "sms_api_key":       mask(row.sms_api_key),
+        "sms_api_secret":    mask(row.sms_api_secret),
+        "sms_from":          row.sms_from,
+        "sms_to":            row.sms_to,
     }
 
 
@@ -89,46 +106,43 @@ async def get_notification_settings(
 async def save_notification_settings(
     body: NotificationSettingsBody,
     user=Depends(get_current_user),
-    mdb=Depends(get_mdb),
+    db: AsyncSession = Depends(get_pg_session),
 ):
     """알림 설정을 저장한다. 빈 문자열 비밀값은 기존 값을 유지한다."""
     channels = [c for c in body.channels if c in _SUPPORTED_CHANNELS]
-    now = datetime.now(timezone.utc).isoformat()
+    uid = uuid.UUID(user["id"])
 
-    # 기존 저장된 비밀값을 읽어 빈 입력 시 유지
-    existing = await mdb.notification_settings.find_one({"user_id": user["id"]}) or {}
+    row = await _get_settings_row(db, uid)
+    if row is None:
+        row = NotificationSettings(user_id=uid)
+        db.add(row)
 
-    def keep_secret(new_val: str, field: str) -> str:
+    def keep_secret(new_val: str, existing_val: str) -> str:
         """값이 마스크 플레이스홀더("****")이거나 빈 문자열이면 기존 저장값을 유지한다."""
         if not new_val or new_val == "****":
-            return existing.get(field, "")
+            return existing_val
         return new_val
 
-    await mdb.notification_settings.update_one(
-        {"user_id": user["id"]},
-        {"$set": {
-            "channels":          channels,
-            "telegram_token":    keep_secret(body.telegram_token, "telegram_token"),
-            "telegram_chat_id":  body.telegram_chat_id,
-            "slack_webhook_url": body.slack_webhook_url,
-            "email_to":          body.email_to,
-            "email_host":        body.email_host,
-            "email_port":        body.email_port,
-            "email_user":        body.email_user,
-            "email_password":    keep_secret(body.email_password, "email_password"),
-            "email_from":        body.email_from,
-            "kakao_api_key":     keep_secret(body.kakao_api_key, "kakao_api_key"),
-            "kakao_api_secret":  keep_secret(body.kakao_api_secret, "kakao_api_secret"),
-            "kakao_sender_key":  body.kakao_sender_key,
-            "kakao_phone":       body.kakao_phone,
-            "sms_api_key":       keep_secret(body.sms_api_key, "sms_api_key"),
-            "sms_api_secret":    keep_secret(body.sms_api_secret, "sms_api_secret"),
-            "sms_from":          body.sms_from,
-            "sms_to":            body.sms_to,
-            "updated_at":        now,
-        }},
-        upsert=True,
-    )
+    row.channels = channels
+    row.telegram_token = keep_secret(body.telegram_token, row.telegram_token)
+    row.telegram_chat_id = body.telegram_chat_id
+    row.slack_webhook_url = body.slack_webhook_url
+    row.email_to = body.email_to
+    row.email_host = body.email_host
+    row.email_port = body.email_port
+    row.email_user = body.email_user
+    row.email_password = keep_secret(body.email_password, row.email_password)
+    row.email_from = body.email_from
+    row.kakao_api_key = keep_secret(body.kakao_api_key, row.kakao_api_key)
+    row.kakao_api_secret = keep_secret(body.kakao_api_secret, row.kakao_api_secret)
+    row.kakao_sender_key = body.kakao_sender_key
+    row.kakao_phone = body.kakao_phone
+    row.sms_api_key = keep_secret(body.sms_api_key, row.sms_api_key)
+    row.sms_api_secret = keep_secret(body.sms_api_secret, row.sms_api_secret)
+    row.sms_from = body.sms_from
+    row.sms_to = body.sms_to
+
+    await db.commit()
     return {"ok": True}
 
 
@@ -153,3 +167,23 @@ async def test_notification(
         user_id=user["id"],
     )
     return {"ok": True, "message": "테스트 알림을 전송했습니다."}
+
+
+@router.get("/history")
+async def notification_history(
+    limit: int = Query(50, ge=1, le=200),
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_pg_session),
+):
+    """현재 사용자의 최근 알림 발송 이력을 조회한다."""
+    result = await db.execute(
+        select(NotificationLog)
+        .where(NotificationLog.user_id == uuid.UUID(user["id"]))
+        .order_by(NotificationLog.created_at.desc())
+        .limit(limit)
+    )
+    events = [{
+        "subject": ev.subject, "message": ev.message, "channels": ev.channels,
+        "created_at": ev.created_at.isoformat(),
+    } for ev in result.scalars().all()]
+    return {"events": events, "count": len(events)}

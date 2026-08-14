@@ -6,11 +6,11 @@ resource "aws_secretsmanager_secret" "app" {
 resource "aws_secretsmanager_secret_version" "app" {
   secret_id = aws_secretsmanager_secret.app.id
 
-  # Placeholder values — update MONGO_URI password after DocumentDB creation
+  # Placeholder values — update DATABASE_URL password after RDS creation
   secret_string = jsonencode({
     SESSION_SECRET  = "change-me-32-char-random-session-secret"
     JWT_SECRET      = "change-me-32-char-random-jwt-secret"
-    MONGO_URI       = "mongodb://docdbuser:ChangeMe123!@${aws_docdb_cluster.main.endpoint}:27017/fin_agent?tls=true&replicaSet=rs0&readPreference=secondaryPreferred&retryWrites=false"
+    DATABASE_URL    = "postgresql+asyncpg://pguser:ChangeMe123!@${aws_db_instance.main.endpoint}/fin_ai"
     REDIS_URL       = "redis://172.30.2.131:6379"
     OLLAMA_BASE_URL = "http://172.30.2.131:11434"
     QDRANT_URL      = "http://172.30.2.131:6333"

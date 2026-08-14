@@ -36,29 +36,29 @@ lumina_osaka:
         az: ap-northeast-3c
         map_public: true
         role: public
-      - key: docdb_a
-        name: lumina-osaka-docdb-a
+      - key: postgres_a
+        name: lumina-osaka-postgres-a
         cidr: 10.30.48.0/24
         az: ap-northeast-3a
         map_public: false
-        role: docdb
-      - key: docdb_b
-        name: lumina-osaka-docdb-b
+        role: postgres
+      - key: postgres_b
+        name: lumina-osaka-postgres-b
         cidr: 10.30.49.0/24
         az: ap-northeast-3b
         map_public: false
-        role: docdb
-      - key: docdb_c
-        name: lumina-osaka-docdb-c
+        role: postgres
+      - key: postgres_c
+        name: lumina-osaka-postgres-c
         cidr: 10.30.50.0/24
         az: ap-northeast-3c
         map_public: false
-        role: docdb
+        role: postgres
 
   security_groups:
     alb: lumina-alb-sg-osaka
     ecs: lumina-ecs-sg-osaka
-    docdb: lumina-docdb-sg-osaka
+    postgres: lumina-postgres-sg-osaka
     dependency: lumina-ec2-services-sg-osaka
 
   iam:
@@ -82,13 +82,12 @@ lumina_osaka:
     root_volume_size: 30
     data_dir: /data/lumina-invest
 
-  docdb:
-    subnet_group_name: lumina-docdb-subnet-group-osaka
-    cluster_identifier: lumina-docdb-osaka
-    instance_identifier: lumina-docdb-osaka-1
+  postgres:
+    subnet_group_name: lumina-postgres-subnet-group-osaka
+    instance_identifier: lumina-postgres-osaka
     instance_class: db.t3.medium
-    master_username: docdbuser
-    db_name: fin_agent
+    master_username: pguser
+    db_name: fin_ai
 
   secret:
     name: lumina-invest/osaka/app
@@ -120,8 +119,6 @@ lumina_osaka:
         image: 086015456585.dkr.ecr.ap-northeast-3.amazonaws.com/lumina-invest:latest
         log_group: /ecs/lumina-invest-api-osaka
         environment:
-          - name: MONGO_DB
-            value: fin_agent
           - name: TRUST_PROXY
             value: "true"
           - name: COOKIE_SECURE
@@ -129,7 +126,7 @@ lumina_osaka:
         secret_keys:
           - SESSION_SECRET
           - JWT_SECRET
-          - MONGO_URI
+          - DATABASE_URL
           - REDIS_URL
           - OLLAMA_BASE_URL
           - QDRANT_URL
@@ -153,11 +150,8 @@ lumina_osaka:
           - --loglevel=info
           - --concurrency=2
           - --queues=celery
-        environment:
-          - name: MONGO_DB
-            value: fin_agent
         secret_keys:
-          - MONGO_URI
+          - DATABASE_URL
           - REDIS_URL
           - OLLAMA_BASE_URL
           - QDRANT_URL

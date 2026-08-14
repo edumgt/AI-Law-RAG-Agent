@@ -31,7 +31,7 @@ async def _get_latest(symbol: str, unit: str) -> dict:
 
 @router.get("/indicators")
 async def macro_indicators(_user=Depends(get_current_user)):
-    """거시경제 지표 현황 (금리·물가·유가·환율·주가지수). MongoDB cache-first."""
+    """거시경제 지표 현황 (금리·물가·유가·환율·주가지수). PostgreSQL cache-first."""
     import asyncio
     cached = await cache_get(KEY_MACRO_INDICATORS, max_age_hours=2)
     if cached is not None:
@@ -46,7 +46,7 @@ async def macro_indicators(_user=Depends(get_current_user)):
 
 @router.get("/industry")
 async def macro_industry(_user=Depends(get_current_user)):
-    """미국 섹터 ETF 기반 산업 분석. MongoDB cache-first."""
+    """미국 섹터 ETF 기반 산업 분석. PostgreSQL cache-first."""
     import asyncio
     cached = await cache_get(KEY_SECTOR_ETFS, max_age_hours=2)
     if cached is not None:
@@ -62,7 +62,7 @@ async def macro_industry(_user=Depends(get_current_user)):
 
 @router.get("/us-stocks")
 async def macro_us_stocks(_user=Depends(get_current_user)):
-    """미국 주요 종목 시세. MongoDB cache-first."""
+    """미국 주요 종목 시세. PostgreSQL cache-first."""
     import asyncio
     cached = await cache_get(KEY_US_STOCKS, max_age_hours=2)
     if cached is not None:
