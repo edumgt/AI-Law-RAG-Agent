@@ -22,6 +22,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/ ./app/
 COPY public/ ./public/
 COPY prompts/ ./prompts/
+COPY alembic/ ./alembic/
+COPY alembic.ini ./alembic.ini
 
 # Data directory (CSV files mounted at runtime)
 RUN mkdir -p data && chmod -R 777 data
