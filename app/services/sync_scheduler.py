@@ -158,27 +158,36 @@ async def _sync_us_stocks() -> None:
 
 
 async def _sync_stock_candles() -> None:
-    """Cache 1y daily candles for all quant stocks (heavy — runs daily)."""
-    from app.services.stock import get_candles
-    for stock in QUANT_STOCKS:
-        sym = stock["symbol"]
-        try:
-            data = await get_candles(sym, period="1y", interval="1d")
-            if data.get("candles"):
-                await cache_set(f"candles:{sym}:1y:1d", data)
-                logger.info("[sync] candles %s: %d bars", sym, len(data["candles"]))
-        except Exception as e:
-            logger.warning("[sync] candles %s failed: %s", sym, e)
+    """Warm the candle + indicator cache for the full quant universe (~30 stocks).
 
-    # Also cache quant indicators for signal screening
-    for stock in QUANT_STOCKS:
-        sym = stock["symbol"]
-        try:
-            data = await get_quant_indicators(sym, period="1y")
-            if not data.get("error"):
-                await cache_set(f"indicators:{sym}:1y", data)
-        except Exception as e:
-            logger.warning("[sync] indicators %s failed: %s", sym, e)
+    Runs on every sync cycle (hourly). Concurrency is capped so we don't hammer
+    Yahoo Finance with 30+ simultaneous requests; get_candles() already caches
+    its own result via data_cache, so this just keeps that cache fresh for the
+    robo-advisor / auto-trade scans that read from the same universe.
+    """
+    from app.services.stock import get_candles
+    sem = asyncio.Semaphore(6)
+
+    async def _warm_candles(sym: str) -> None:
+        async with sem:
+            try:
+                data = await get_candles(sym, period="2y", interval="1d")
+                if data.get("candles"):
+                    logger.info("[sync] candles %s: %d bars", sym, len(data["candles"]))
+            except Exception as e:
+                logger.warning("[sync] candles %s failed: %s", sym, e)
+
+    async def _warm_indicators(sym: str) -> None:
+        async with sem:
+            try:
+                data = await get_quant_indicators(sym, period="2y")
+                if not data.get("error"):
+                    await cache_set(f"indicators:{sym}:2y", data)
+            except Exception as e:
+                logger.warning("[sync] indicators %s failed: %s", sym, e)
+
+    await asyncio.gather(*(_warm_candles(s["symbol"]) for s in QUANT_STOCKS))
+    await asyncio.gather(*(_warm_indicators(s["symbol"]) for s in QUANT_STOCKS))
 
 
 # ── Public sync entrypoint ────────────────────────────────────────────────────

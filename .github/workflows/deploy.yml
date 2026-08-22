@@ -1,0 +1,49 @@
+# main에 push되면 fund-web EC2(ap-northeast-2, docker compose 단일 서버)로
+# 코드를 rsync하고 컨테이너를 재빌드한다. .env는 서버에만 존재하고 git에는
+# 올라가지 않으므로(.gitignore) 배포 시 절대 건드리지 않는다 — rsync에서
+# 명시적으로 제외한다.
+name: Deploy to fund-web EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SSH 키 준비
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.FUND_WEB_SSH_KEY }}" > ~/.ssh/fund-web.pem
+          chmod 600 ~/.ssh/fund-web.pem
+          ssh-keyscan -H "${{ vars.FUND_WEB_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: 코드 동기화 (.env·데이터는 서버 것 그대로 유지)
+        run: |
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='.env' \
+            --exclude='.env.local' \
+            --exclude='data/' \
+            --exclude='terraform/.terraform' \
+            --exclude='infra/**/.terraform' \
+            --exclude='**/__pycache__' \
+            --exclude='*.pyc' \
+            -e "ssh -i ~/.ssh/fund-web.pem -o StrictHostKeyChecking=yes" \
+            ./ "${{ vars.FUND_WEB_USER }}@${{ vars.FUND_WEB_HOST }}:/home/${{ vars.FUND_WEB_USER }}/lumina-invest/"
+
+      - name: 컨테이너 재빌드 및 재기동
+        run: |
+          ssh -i ~/.ssh/fund-web.pem -o StrictHostKeyChecking=yes \
+            "${{ vars.FUND_WEB_USER }}@${{ vars.FUND_WEB_HOST }}" \
+            "cd /home/${{ vars.FUND_WEB_USER }}/lumina-invest && sudo docker compose up -d --build app ingest celery-worker celery-beat"
+
+      - name: 배포 확인 (헬스체크)
+        run: |
+          sleep 8
+          curl -sf --retry 5 --retry-delay 5 --retry-connrefused \
+            "https://${{ vars.FUND_WEB_DOMAIN }}/api/health"

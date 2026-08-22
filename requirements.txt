@@ -4,6 +4,7 @@ uvicorn[standard]>=0.32.0
 python-multipart>=0.0.20
 httpx>=0.27.0
 redis[asyncio]>=5.2.0
+boto3>=1.35.0  # Comprehend 감성분석 / SageMaker 학습 결과(S3) 조회
 sqlalchemy[asyncio]>=2.0.36
 asyncpg>=0.30.0
 alembic>=1.14.0

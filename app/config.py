@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     NEO4J_USER: str = "neo4j"
     NEO4J_PASSWORD: str = "finagent123"
 
+    # ── AWS (Comprehend 감성분석 / SageMaker 배치 학습 결과 조회) ──────────────
+    AWS_REGION: str = "ap-northeast-2"  # 실제 운영 EC2(fund-web)가 있는 리전
+    ML_ARTIFACTS_BUCKET: str = ""  # SageMaker 학습 산출물(scores.json)이 저장된 S3 버킷
+
     ADMIN_EMAILS: str = ""
     TRUST_PROXY: bool = False
     COOKIE_SECURE: bool = False

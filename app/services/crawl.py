@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.lib.ollama import OllamaClient
 from app.models import CrawledDoc
+from app.services.data_cache import cache_set
+from app.services.sentiment import analyze_sentiment, aggregate_sentiment_score
 
 
 async def _upsert_crawled_doc(db: AsyncSession, url: str, title: str, content: str, source: str) -> None:
@@ -255,6 +257,17 @@ async def crawl_naver_stock(
     if not name and not news_items:
         log.append("[ERROR] 네이버 페이지 파싱 실패")
         return 0
+
+    if news_items:
+        sentiment_results = await analyze_sentiment(news_items)
+        agg = aggregate_sentiment_score(sentiment_results)
+        if agg is not None:
+            await cache_set(f"sentiment:{stock_code}", {
+                "stock_code": stock_code,
+                "score": agg,
+                "sample_size": len(news_items),
+            })
+            log.append(f"  → 뉴스 감성 스코어 {agg:+.2f} ({len(news_items)}건)")
 
     text = f"종목명: {name}\n현재가: {current}\n"
     if news_items:

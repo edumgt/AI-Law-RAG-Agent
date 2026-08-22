@@ -3,16 +3,46 @@ import httpx
 from datetime import datetime, timezone
 from typing import Any
 
+from app.services.data_cache import cache_get, cache_set
+
 YAHOO_CHART = "https://query2.finance.yahoo.com/v8/finance/chart"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; FinAgent/1.0)"}
 
-# 대표 국내 상장사 5종목 (퀀트 대상)
+# 국내 상장사 퀀트 스크리닝 대상 유니버스 (섹터 분산 ~30종목).
+# 실제 추천/자동매매/스크리닝은 이 유니버스 전체를 스캔해 데이터 기반으로 종목을 선정한다 —
+# 화면에 노출되는 개별 종목은 매 요청마다 계산된 스코어에 따라 달라질 수 있다.
 QUANT_STOCKS = [
     {"symbol": "005930.KS", "name": "삼성전자", "sector": "IT/반도체"},
     {"symbol": "000660.KS", "name": "SK하이닉스", "sector": "IT/반도체"},
+    {"symbol": "042700.KS", "name": "한미반도체", "sector": "IT/반도체"},
+    {"symbol": "009150.KS", "name": "삼성전기", "sector": "전자부품"},
     {"symbol": "035420.KS", "name": "NAVER", "sector": "IT/인터넷"},
+    {"symbol": "035720.KS", "name": "카카오", "sector": "IT/인터넷"},
+    {"symbol": "018260.KS", "name": "삼성에스디에스", "sector": "IT서비스"},
+    {"symbol": "259960.KS", "name": "크래프톤", "sector": "게임"},
+    {"symbol": "036570.KS", "name": "엔씨소프트", "sector": "게임"},
+    {"symbol": "251270.KS", "name": "넷마블", "sector": "게임"},
     {"symbol": "005380.KS", "name": "현대자동차", "sector": "자동차"},
-    {"symbol": "051910.KS", "name": "LG화학", "sector": "화학"},
+    {"symbol": "000270.KS", "name": "기아", "sector": "자동차"},
+    {"symbol": "051910.KS", "name": "LG화학", "sector": "화학/배터리"},
+    {"symbol": "006400.KS", "name": "삼성SDI", "sector": "화학/배터리"},
+    {"symbol": "373220.KS", "name": "LG에너지솔루션", "sector": "화학/배터리"},
+    {"symbol": "010950.KS", "name": "S-Oil", "sector": "정유"},
+    {"symbol": "207940.KS", "name": "삼성바이오로직스", "sector": "바이오"},
+    {"symbol": "068270.KS", "name": "셀트리온", "sector": "바이오"},
+    {"symbol": "105560.KS", "name": "KB금융", "sector": "금융"},
+    {"symbol": "055550.KS", "name": "신한지주", "sector": "금융"},
+    {"symbol": "086790.KS", "name": "하나금융지주", "sector": "금융"},
+    {"symbol": "005490.KS", "name": "POSCO홀딩스", "sector": "철강"},
+    {"symbol": "010130.KS", "name": "고려아연", "sector": "비철금속"},
+    {"symbol": "034730.KS", "name": "SK", "sector": "지주"},
+    {"symbol": "003550.KS", "name": "LG", "sector": "지주"},
+    {"symbol": "015760.KS", "name": "한국전력", "sector": "유틸리티"},
+    {"symbol": "017670.KS", "name": "SK텔레콤", "sector": "통신"},
+    {"symbol": "030200.KS", "name": "KT", "sector": "통신"},
+    {"symbol": "097950.KS", "name": "CJ제일제당", "sector": "식품"},
+    {"symbol": "090430.KS", "name": "아모레퍼시픽", "sector": "화장품"},
+    {"symbol": "352820.KS", "name": "하이브", "sector": "엔터테인먼트"},
 ]
 
 MARKET_INDICES = [
@@ -56,7 +86,12 @@ async def get_quote(symbol: str) -> dict:
 
 
 async def get_candles(symbol: str, period: str = "1y", interval: str = "1d") -> dict:
-    """캔들 차트 데이터 (OHLCV)."""
+    """캔들 차트 데이터 (OHLCV). 반복 스캔 시 Yahoo 호출을 줄이기 위해 캐시를 우선 사용한다."""
+    cache_key = f"candles:{symbol}:{period}:{interval}"
+    cached = await cache_get(cache_key, max_age_hours=6)
+    if cached is not None:
+        return cached
+
     # 10년치는 10y range로 요청
     data = await _yahoo_chart(symbol, interval, period)
     if not data:
@@ -83,7 +118,10 @@ async def get_candles(symbol: str, period: str = "1y", interval: str = "1d") -> 
             "volume": volumes[i] if i < len(volumes) else None,
         })
 
-    return {"symbol": symbol, "interval": interval, "period": period, "candles": candles}
+    result = {"symbol": symbol, "interval": interval, "period": period, "candles": candles}
+    if candles:
+        await cache_set(cache_key, result)
+    return result
 
 
 async def get_market_summary() -> list[dict]:

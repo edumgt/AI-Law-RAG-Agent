@@ -104,6 +104,121 @@ def screen_pattern(candles: list[dict], model: str) -> dict:
     return {"signal": signal, "score": round(float(score), 2), "confidence": min(95, int(55 + abs(score) * 13)), "reason": reason, "rsi": round(float(x.rsi), 2), "price": round(float(x.close), 2)}
 
 
+def ai_predict_return(candles: list[dict]) -> dict | None:
+    """피처 엔지니어링 후 시계열 교차검증(TimeSeriesSplit)으로 회귀(수익률) +
+    분류(방향성) 신호를 함께 산출한다.
+
+    단일 80/20 분할 대신 여러 폴드의 평균 성능으로 모델을 고르고 confidence를
+    매겨서, 한 번의 운 좋은/나쁜 분할에 흔들리지 않게 한다. 종목마다 즉석에서
+    가볍게 학습하므로(그리드서치 없음) 유니버스 전체를 스캔해도 응답 지연이 크지
+    않다. sklearn 미설치 시 None을 반환하며, 호출측은 과거 샤프비율만으로 순위를
+    매기는 방식으로 대체한다.
+
+    confidence(0~1)는 회귀 CV R^2와 분류 정확도/신뢰도를 반반 섞은 대략적인
+    품질 지표다 — 캘리브레이션된 확률이 아니라, 호출측이 "이 종목의 AI 예측을
+    얼마나 반영할지" 가중치로 쓰기 위한 상대적 지표다.
+    """
+    try:
+        from sklearn.linear_model import Ridge
+        from sklearn.ensemble import GradientBoostingRegressor
+        from sklearn.model_selection import TimeSeriesSplit
+        from sklearn.preprocessing import StandardScaler
+    except ImportError:
+        return None
+
+    from app.services.quant_pipeline import feature_engineer, FEATURE_COLS
+
+    df = preprocess(candles)
+    df = feature_engineer(df)  # 'target'(방향성 3-class 라벨) 포함
+    if len(df) < 80:
+        return None
+
+    close = df["close"].astype(float)
+    df = df.copy()
+    df["fwd_return"] = close.pct_change(5).shift(-5)
+    latest_features = df[FEATURE_COLS].iloc[-1:].values
+    labeled = df.dropna(subset=["fwd_return"])
+    if len(labeled) < 60:
+        return None
+
+    X = labeled[FEATURE_COLS].values
+    y_reg = labeled["fwd_return"].values
+
+    n_splits = 4 if len(X) >= 150 else 3
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    candidates = {
+        "Ridge": lambda: Ridge(alpha=1.0),
+        "GradientBoosting": lambda: GradientBoostingRegressor(
+            n_estimators=80, max_depth=3, learning_rate=0.05, random_state=42
+        ),
+    }
+    fold_scores: dict[str, list[float]] = {name: [] for name in candidates}
+    for tr_idx, va_idx in tscv.split(X):
+        if len(va_idx) < 3:
+            continue
+        scaler = StandardScaler().fit(X[tr_idx])
+        X_tr_s, X_va_s = scaler.transform(X[tr_idx]), scaler.transform(X[va_idx])
+        for name, make in candidates.items():
+            m = make()
+            m.fit(X_tr_s, y_reg[tr_idx])
+            fold_scores[name].append(float(m.score(X_va_s, y_reg[va_idx])))
+
+    avg_scores = {name: (float(np.mean(s)) if s else -999.0) for name, s in fold_scores.items()}
+    best_name = max(avg_scores, key=avg_scores.get)
+    best_r2 = avg_scores[best_name]
+
+    # 최종 예측은 전체 라벨 데이터로 재학습한 best 모델을 사용
+    scaler_full = StandardScaler().fit(X)
+    final_model = candidates[best_name]()
+    final_model.fit(scaler_full.transform(X), y_reg)
+    pred_5d = float(final_model.predict(scaler_full.transform(latest_features))[0])
+
+    # 방향성 분류 (LightGBM) — 회귀와 별도로 매수/관망/매도 신호 + 신뢰도 산출
+    signal, signal_confidence, cls_acc = 0, 0.5, None
+    try:
+        import lightgbm as lgb
+        y_cls = (labeled["target"].values + 1).astype(int)
+        split = max(1, int(len(X) * 0.8))
+        if len(X[split:]) >= 5 and len(set(y_cls[split:])) > 1:
+            d_tr = lgb.Dataset(X[:split], label=y_cls[:split])
+            d_va = lgb.Dataset(X[split:], label=y_cls[split:], reference=d_tr)
+            params = {"objective": "multiclass", "num_class": 3, "num_leaves": 15,
+                      "learning_rate": 0.08, "feature_fraction": 0.8, "verbosity": -1}
+            lgb_model = lgb.train(params, d_tr, num_boost_round=100, valid_sets=[d_va],
+                                   callbacks=[lgb.early_stopping(10, verbose=False), lgb.log_evaluation(-1)])
+            va_pred = np.argmax(lgb_model.predict(X[split:]), axis=1)
+            cls_acc = float((va_pred == y_cls[split:]).mean())
+        else:
+            lgb_model = lgb.train(
+                {"objective": "multiclass", "num_class": 3, "verbosity": -1},
+                lgb.Dataset(X, label=y_cls), num_boost_round=50,
+            )
+        probs = lgb_model.predict(X[-1:])[0]
+        signal = int(np.argmax(probs)) - 1
+        signal_confidence = float(np.max(probs))
+    except Exception:
+        signal = 1 if pred_5d > 0 else (-1 if pred_5d < 0 else 0)
+
+    # 5일 예측을 그대로 연환산(252/5 제곱)하면 예측이 조금만 튀어도 지수적으로
+    # 폭발해 비현실적인 값이 나온다 (R^2가 음수인 종목에서 특히). 표시용으로 clip.
+    pred_5d_clipped = max(-0.2, min(0.2, pred_5d))
+    pred_ann = (1 + pred_5d_clipped) ** (252 / 5) - 1
+
+    reg_confidence = max(0.0, min(1.0, (best_r2 + 1) / 2))  # R^2(대략 -1~1)를 0~1로 매핑
+    cls_confidence = cls_acc if cls_acc is not None else signal_confidence
+    confidence = round(0.5 * reg_confidence + 0.5 * cls_confidence, 4)
+
+    return {
+        "pred_5d_return_pct": round(pred_5d * 100, 3),
+        "pred_ann_return_pct": round(max(-90.0, min(300.0, pred_ann * 100)), 2),
+        "val_r2": round(best_r2, 4),
+        "model": f"{best_name}(TimeSeriesSplit {n_splits}-fold)",
+        "signal": signal,
+        "signal_confidence": round(signal_confidence, 4),
+        "confidence": confidence,
+    }
+
+
 def optimize_portfolio(stock_data: list[dict], risk_profile: str) -> dict:
     """최근 일수익률의 공분산을 이용한 long-only 최소분산/수익 혼합 배분."""
     series, labels = [], []

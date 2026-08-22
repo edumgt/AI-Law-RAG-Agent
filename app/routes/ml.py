@@ -1,4 +1,5 @@
 """ML 모델 비교 · 클러스터링 · 계절성 · 회귀 API."""
+import asyncio
 from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel
 import numpy as np
@@ -11,7 +12,9 @@ from app.services.ml_models import (
     seasonality_analysis,
     regression_forecast,
 )
-from app.services.investment_research import optimize_portfolio
+from app.services.investment_research import optimize_portfolio, ai_predict_return
+from app.services.data_cache import cache_get
+from app.services.quant_ai_scores import get_batch_training_scores
 
 router = APIRouter(prefix="/api/ml")
 
@@ -110,49 +113,147 @@ async def robo_allocation(
     diff = round(100 - sum(alloc.values()), 1)
     alloc["현금"] = round(alloc["현금"] + diff, 1)
 
-    # 국내 대표 종목의 최근 수익률/변동성으로 간단 스코어링
-    picks = []
-    stock_data = []
-    for s in QUANT_STOCKS:
-        data = await get_candles(s["symbol"], period="2y", interval="1d")
+    # 유니버스 전체(~30종목)를 동시 스캔해 과거 성과(샤프비율) + AI 학습 기반
+    # 예측 수익률(Ridge 회귀, 피처 엔지니어링)을 함께 스코어링한다.
+    # 화면에 뜨는 종목은 고정되어 있지 않고 매 요청마다 이 스캔 결과로 결정된다.
+    sem = asyncio.Semaphore(8)
+    batch_scores = await get_batch_training_scores()  # SageMaker 일 1회 배치 학습 (없으면 None)
+
+    async def _screen(s: dict) -> dict | None:
+        async with sem:
+            data = await get_candles(s["symbol"], period="2y", interval="1d")
         candles = data.get("candles", [])
         if len(candles) < 80:
-            continue
+            return None
         closes = np.array([float(c["close"]) for c in candles if c.get("close") is not None], dtype=float)
         if len(closes) < 80:
-            continue
-        stock_data.append({"symbol": s["symbol"], "candles": candles})
+            return None
         rets = np.diff(closes) / closes[:-1]
         ann_ret = float(np.mean(rets) * 252)
         ann_vol = float(np.std(rets) * np.sqrt(252)) if np.std(rets) > 0 else 0.0001
         sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
-        picks.append({
+        ai = ai_predict_return(candles)
+        code6 = s["symbol"].split(".")[0]
+        sentiment = await cache_get(f"sentiment:{code6}", max_age_hours=72)
+        batch = (batch_scores or {}).get("scores", {}).get(s["symbol"])
+        return {
             "symbol": s["symbol"],
             "name": s["name"],
             "sector": s.get("sector", ""),
+            "candles": candles,
             "ann_return_pct": round(ann_ret * 100, 2),
             "ann_vol_pct": round(ann_vol * 100, 2),
-            "score": sharpe,
-        })
+            "sharpe": sharpe,
+            "ai": ai,
+            "sentiment": sentiment,
+            "batch": batch,
+        }
+
+    screened = await asyncio.gather(*(_screen(s) for s in QUANT_STOCKS))
+    picks = [p for p in screened if p is not None]
 
     if not picks:
         raise HTTPException(422, "포트폴리오 계산용 시세 데이터가 부족합니다.")
+
+    def _rank01(values: list[float]) -> list[float]:
+        order = sorted(range(len(values)), key=lambda i: values[i])
+        ranks = [0.0] * len(values)
+        denom = max(1, len(values) - 1)
+        for r, i in enumerate(order):
+            ranks[i] = r / denom
+        return ranks
+
+    def _confidence_weighted_component(
+        raw: list[float | None], confidences: list[float | None], default_confidence: float,
+    ) -> tuple[list[float], list[float]] | None:
+        """값이 있는 종목만 순위화하고, 종목별 confidence를 가중치로 함께 반환한다.
+
+        전체 유니버스가 아니라 "이 종목의 AI 예측을 이 종목의 최종 점수에 얼마나
+        반영할지"를 종목 단위로 다르게 준다 — 예측 품질이 낮은(음의 R^2 등) 종목의
+        신호는 약하게, 신뢰도가 높은 종목의 신호는 강하게 반영된다. 값이 아예 없는
+        종목은 가중치 0(순위 결과에 영향 없음).
+        """
+        valid = [v for v in raw if v is not None]
+        if not valid:
+            return None
+        fallback = float(np.median(valid))
+        ranks = _rank01([v if v is not None else fallback for v in raw])
+        weights = [
+            (c if c is not None else default_confidence) if v is not None else 0.0
+            for v, c in zip(raw, confidences)
+        ]
+        return ranks, weights
+
+    sharpe_rank = _rank01([p["sharpe"] for p in picks])
+
+    weighted_components: list[tuple[list[float], list[float]]] = []
+    ai_component = _confidence_weighted_component(
+        [p["ai"]["pred_ann_return_pct"] if p["ai"] else None for p in picks],
+        [p["ai"].get("confidence") if p["ai"] else None for p in picks],
+        default_confidence=0.6,
+    )
+    if ai_component:
+        weighted_components.append(ai_component)
+    batch_component = _confidence_weighted_component(
+        [p["batch"]["pred_ann_return_pct"] if p["batch"] else None for p in picks],
+        [p["batch"].get("confidence") if p["batch"] else None for p in picks],
+        default_confidence=0.6,
+    )
+    if batch_component:
+        weighted_components.append(batch_component)
+    sentiment_component = _confidence_weighted_component(
+        [p["sentiment"]["score"] if p["sentiment"] else None for p in picks],
+        [None for _ in picks],  # 감성분석엔 자체 신뢰도 개념이 없어 고정 가중치 사용
+        default_confidence=0.4,
+    )
+    if sentiment_component:
+        weighted_components.append(sentiment_component)
+
+    # 샤프비율(과거 실측치)은 항상 가중치 1.0으로 포함하고, 나머지는 종목별 confidence로 가중 평균
+    for i, p in enumerate(picks):
+        weighted_sum = sharpe_rank[i] * 1.0
+        total_weight = 1.0
+        for ranks, weights in weighted_components:
+            weighted_sum += ranks[i] * weights[i]
+            total_weight += weights[i]
+        p["combined_score"] = round(weighted_sum / total_weight, 4)
+    picks.sort(key=lambda x: x["combined_score"], reverse=True)
+
+    # 스코어 상위 종목만 최적화 대상으로 압축 (추천 종목 수가 유니버스 전체로 흩어지지 않게)
+    top_n = min(8, len(picks))
+    candidates = picks[:top_n]
+    stock_data = [{"symbol": c["symbol"], "candles": c["candles"]} for c in candidates]
 
     optimized = optimize_portfolio(stock_data, risk)
     if "error" in optimized:
         raise HTTPException(422, optimized["error"])
     optimized_weights = optimized["weights"]
-    picks.sort(key=lambda x: optimized_weights.get(x["symbol"], 0), reverse=True)
-    top = [p for p in picks if p["symbol"] in optimized_weights]
+    candidates.sort(key=lambda x: optimized_weights.get(x["symbol"], 0), reverse=True)
+    top = [p for p in candidates if p["symbol"] in optimized_weights]
     stock_bucket = alloc["국내주식"] + alloc["해외주식"]
     stock_picks = []
     for p in top:
         w = round(stock_bucket * optimized_weights[p["symbol"]] / 100, 1)
+        signal_labels = {1: "매수", 0: "관망", -1: "매도"}
+        notes = []
+        if p["ai"]:
+            sig = signal_labels.get(p["ai"].get("signal"), "")
+            notes.append(f"AI 예측 수익률 {p['ai']['pred_ann_return_pct']}% ({sig}, 신뢰도 {p['ai']['confidence']:.2f})")
+        if p["batch"]:
+            sig = signal_labels.get(p["batch"].get("latest_signal"), "")
+            notes.append(f"배치학습 예측 {p['batch']['pred_ann_return_pct']}% ({sig}, 신뢰도 {p['batch'].get('confidence', 0):.2f})")
+        if p["sentiment"]:
+            notes.append(f"뉴스 감성 {p['sentiment']['score']:+.2f}")
+        note_text = (", " + ", ".join(notes)) if notes else ""
         stock_picks.append({
             "name": p["name"],
             "code": p["symbol"],
+            "sector": p["sector"],
             "weight": w,
-            "reason": f"연환산 수익률 {p['ann_return_pct']}%, 변동성 {p['ann_vol_pct']}%",
+            "reason": f"연환산 수익률 {p['ann_return_pct']}%, 변동성 {p['ann_vol_pct']}%{note_text}",
+            "ai_prediction": p["ai"],
+            "batch_training": p["batch"],
+            "news_sentiment": p["sentiment"],
         })
 
     # 최적화된 주식 바스켓의 과거 기대수익률을 전체 자산배분 비중에 반영
