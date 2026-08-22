@@ -203,6 +203,28 @@
       font-weight: 700;
     }
 
+    /* ── GNB 더보기 offcanvas (우측, LNB 스타일 재사용) ─────────── */
+    #gnb-offcanvas-backdrop {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,.35);
+      z-index: 200;
+    }
+    #gnb-offcanvas-backdrop.open { display: block; }
+    #gnb-offcanvas {
+      position: fixed;
+      top: 0; right: -260px; bottom: 0;
+      width: 240px;
+      background: #ffffff;
+      border-left: 1px solid var(--border);
+      box-shadow: -4px 0 16px rgba(0,0,0,.08);
+      z-index: 201;
+      display: flex;
+      flex-direction: column;
+      transition: right .22s cubic-bezier(.4,0,.2,1);
+    }
+    #gnb-offcanvas.open { right: 0; }
+
     /* ── Main wrapper ────────────────────────────────── */
     #app-wrapper {
       display: flex;
@@ -642,8 +664,6 @@
     <button class="gnb-item" data-gnb="company"><i class="fa-solid fa-chart-pie"></i> 투자 인디케이터</button>
     <button class="gnb-item" data-gnb="ml"><i class="fa-solid fa-microchip"></i> ML·딥러닝</button>
     <button class="gnb-item" data-gnb="invest"><i class="fa-solid fa-magnifying-glass-dollar"></i> 투자분석</button>
-    <button class="gnb-item" data-gnb="finance"><i class="fa-solid fa-coins"></i> 금융 지식</button>
-    <button class="gnb-item" data-gnb="sysadmin"><i class="fa-solid fa-gear"></i> 시스템</button>
   </div>
 
   <!-- 우측: 시세 + 사용자 -->
@@ -661,12 +681,29 @@
     <button id="logout-btn" class="btn-secondary" style="padding:6px 12px; font-size:14px;">
       <i class="fa-solid fa-arrow-right-from-bracket" style="margin-right:4px;"></i>로그아웃
     </button>
+    <!-- 더보기 (금융 지식·시스템 offcanvas) -->
+    <button id="gnb-more-btn" class="btn-secondary" style="padding:6px 10px;" title="더보기" aria-label="더보기 메뉴">
+      <i class="fa-solid fa-ellipsis-vertical"></i>
+    </button>
     <!-- 모바일 햄버거 -->
     <button id="hamburger-btn" class="btn-secondary" style="padding:5px 9px; display:none;" aria-label="메뉴">
       <i class="fa-solid fa-bars"></i>
     </button>
   </div>
 </header>
+
+<!-- 더보기 offcanvas (금융 지식 / 시스템) -->
+<div id="gnb-offcanvas-backdrop"></div>
+<aside id="gnb-offcanvas">
+  <div class="lnb-header">
+    <div class="lnb-section-title">더보기</div>
+    <button id="gnb-offcanvas-close" class="lnb-toggle" aria-label="닫기"><i class="fa-solid fa-xmark"></i></button>
+  </div>
+  <nav class="lnb-nav">
+    <div class="lnb-item" data-gnb="finance"><i class="fa-solid fa-coins"></i><span>금융 지식</span></div>
+    <div class="lnb-item" data-gnb="sysadmin"><i class="fa-solid fa-gear"></i><span>시스템</span></div>
+  </nav>
+</aside>
 
 <!-- Toast는 common.js setToast()가 동적으로 생성 (#_toast_el) -->
 
@@ -2769,6 +2806,26 @@ function renderLnb(gnbKey) {
     el.addEventListener("click", () => navigate(el.dataset.view));
   });
 }
+
+// GNB 더보기 offcanvas (금융 지식 / 시스템 — LNB 스타일 재사용)
+(function () {
+  const backdrop = document.getElementById("gnb-offcanvas-backdrop");
+  const panel = document.getElementById("gnb-offcanvas");
+  function openOffcanvas() {
+    panel.classList.add("open");
+    backdrop.classList.add("open");
+  }
+  function closeOffcanvas() {
+    panel.classList.remove("open");
+    backdrop.classList.remove("open");
+  }
+  document.getElementById("gnb-more-btn").addEventListener("click", openOffcanvas);
+  document.getElementById("gnb-offcanvas-close").addEventListener("click", closeOffcanvas);
+  backdrop.addEventListener("click", closeOffcanvas);
+  // 항목 선택(금융 지식/시스템)은 기존 [data-gnb] 클릭 리스너가 네비게이션을 처리하고,
+  // 여기서는 선택 후 패널만 닫아준다.
+  panel.querySelectorAll("[data-gnb]").forEach(el => el.addEventListener("click", closeOffcanvas));
+})();
 
 // LNB 토글 (접기/펼치기)
 document.getElementById("lnb-toggle-btn")?.addEventListener("click", () => {

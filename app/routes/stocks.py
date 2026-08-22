@@ -13,6 +13,7 @@ from app.services.stock import (
     get_quote, get_candles, get_market_summary,
     get_quant_indicators, get_fundamentals, QUANT_STOCKS,
 )
+from app.services.krx_companies import search_companies
 from app.services import auto_trade
 from app.services.quant_pipeline import backtest_custom_indicator
 from app.services.investment_research import backtest_strategy, screen_pattern
@@ -90,7 +91,17 @@ async def quant_stock_list():
 
 @router.get("/stocks/search")
 async def stock_search(q: str = Query(..., min_length=1)):
-    """Yahoo Finance 자동완성 API로 종목 검색 (종목명 + 티커)."""
+    """종목 검색: 국내 상장사는 KRX 상장법인목록(로컬 엔진)을 우선 쓰고,
+    결과가 없으면 Yahoo Finance 자동완성으로 보완한다(해외 종목 등).
+
+    Yahoo 자동완성 API가 일부 한글 검색어("카카오" 등)에서 "Invalid Search Query"
+    400을 반환하는 문제가 있어, 한글 종목명/코드 검색은 KRX 목록에서 직접
+    부분일치로 찾는 로컬 엔진이 더 안정적이다.
+    """
+    krx_results = await search_companies(q)
+    if krx_results:
+        return {"results": krx_results}
+
     url = "https://query1.finance.yahoo.com/v1/finance/search"
     params = {
         "q": q,
