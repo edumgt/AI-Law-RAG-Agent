@@ -7,18 +7,25 @@ Yahoo Finance의 자동완성 검색(/v1/finance/search)이 일부 한글 검색
 데이터 출처: KIND(kind.krx.co.kr) 상장법인목록 다운로드 — 코스피/코스닥/코넥스
 전체 ~2,800개 종목의 회사명·종목코드·시장구분을 담고 있다. 인증이나 API 키가
 필요 없는 공개 다운로드이며, 하루 단위로 캐싱해 재사용한다.
+
+주의: kind.krx.co.kr이 AWS ap-northeast-2 데이터센터 IP 대역을 403으로 막는
+것을 실제 운영 서버(EC2)에서 확인했다 — 로컬 개발 환경에서는 정상 접근된다.
+그래서 운영에서는 미리 받아 S3(ML_ARTIFACTS_BUCKET의 krx/company_list.json)에
+올려둔 걸 우선 읽고, 실패하면(로컬 등) KIND에 직접 접근을 시도한다.
 """
 import re
 
 import httpx
 from bs4 import BeautifulSoup
 
+from app.config import settings
 from app.services.data_cache import cache_get, cache_set
 
 KIND_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download"
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; FinAgent/1.0)"}
 CACHE_KEY = "krx_company_list"
 CACHE_TTL_HOURS = 24
+S3_KEY = "krx/company_list.json"
 
 _MARKET_SUFFIX = {
     "유가": "KS",    # KIND 다운로드의 시장구분 표기: 코스피(유가증권시장) = "유가"
@@ -54,15 +61,38 @@ async def _fetch_krx_list() -> list[dict]:
     return companies
 
 
+def _fetch_from_s3() -> list[dict] | None:
+    if not settings.ML_ARTIFACTS_BUCKET:
+        return None
+    try:
+        import json
+        import boto3
+        client = boto3.client("s3", region_name=settings.AWS_REGION)
+        obj = client.get_object(Bucket=settings.ML_ARTIFACTS_BUCKET, Key=S3_KEY)
+        return json.loads(obj["Body"].read())
+    except Exception:
+        return None
+
+
 async def get_krx_companies() -> list[dict]:
-    """캐싱된 KRX 상장법인 목록 (없거나 24시간 지났으면 새로 받아온다)."""
+    """캐싱된 KRX 상장법인 목록 (없거나 24시간 지났으면 새로 받아온다).
+
+    순서: data_cache(Postgres, 24h) → S3(운영 환경 우선) → KIND 직접 다운로드
+    (로컬 개발 등 KIND 접근이 가능한 환경 전용, S3 실패 시 폴백).
+    """
     cached = await cache_get(CACHE_KEY, max_age_hours=CACHE_TTL_HOURS)
     if cached:
         return cached
-    try:
-        companies = await _fetch_krx_list()
-    except Exception:
-        return cached or []  # 다운로드 실패 시 있으면 stale 캐시라도, 없으면 빈 리스트
+
+    import asyncio
+    companies = await asyncio.to_thread(_fetch_from_s3)
+
+    if not companies:
+        try:
+            companies = await _fetch_krx_list()
+        except Exception:
+            return cached or []  # 둘 다 실패 시 있으면 stale 캐시라도, 없으면 빈 리스트
+
     if companies:
         await cache_set(CACHE_KEY, companies)
     return companies

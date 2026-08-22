@@ -39,9 +39,16 @@ resource "aws_iam_role_policy" "fund_web_ai" {
         Resource = "*" # Comprehend는 리소스 레벨 권한을 지원하지 않음
       },
       {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject"]
-        Resource = "${aws_s3_bucket.ml_artifacts.arn}/latest/scores.json"
+        Effect = "Allow"
+        Action = ["s3:GetObject"]
+        # latest/scores.json: SageMaker 배치 학습 결과.
+        # krx/company_list.json: KRX 상장법인목록 — kind.krx.co.kr이 이 EC2의
+        # 퍼블릭 IP(ap-northeast-2 데이터센터 대역)를 403으로 차단해서 직접
+        # 받아올 수 없어, 대신 받을 수 있는 곳에서 미리 올려둔 걸 읽는다.
+        Resource = [
+          "${aws_s3_bucket.ml_artifacts.arn}/latest/scores.json",
+          "${aws_s3_bucket.ml_artifacts.arn}/krx/company_list.json",
+        ]
       },
     ]
   })
