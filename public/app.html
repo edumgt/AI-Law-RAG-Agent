@@ -2847,6 +2847,11 @@ document.getElementById("robo-optimize-btn").addEventListener("click", async () 
   const profile = document.getElementById("robo-risk").value;
   const horizon = parseInt(document.getElementById("robo-horizon").value);
   const amount  = parseInt(document.getElementById("robo-amount").value) || 5000;
+  const optimizeBtn = document.getElementById("robo-optimize-btn");
+  const originalBtnText = optimizeBtn.textContent;
+  // 유니버스 전체(~30종목) 스캔 + AI 학습이라 수 초~수십 초 걸릴 수 있어 로딩 표시 필수
+  optimizeBtn.disabled = true;
+  optimizeBtn.textContent = "AI 분석 중... (최대 30초 소요)";
   try {
     const data = await api("/api/ml/robo/allocation", {
       method: "POST",
@@ -2890,6 +2895,9 @@ document.getElementById("robo-optimize-btn").addEventListener("click", async () 
     document.getElementById("robo-alloc-result").classList.remove("hidden");
   } catch (e) {
     setToast("포트폴리오 최적화 오류: " + e.message, "error");
+  } finally {
+    optimizeBtn.disabled = false;
+    optimizeBtn.textContent = originalBtnText;
   }
 });
 

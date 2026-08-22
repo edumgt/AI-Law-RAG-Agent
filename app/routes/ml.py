@@ -13,7 +13,7 @@ from app.services.ml_models import (
     regression_forecast,
 )
 from app.services.investment_research import optimize_portfolio, ai_predict_return
-from app.services.data_cache import cache_get
+from app.services.data_cache import cache_get, cache_set
 from app.services.quant_ai_scores import get_batch_training_scores
 
 router = APIRouter(prefix="/api/ml")
@@ -132,7 +132,18 @@ async def robo_allocation(
         ann_ret = float(np.mean(rets) * 252)
         ann_vol = float(np.std(rets) * np.sqrt(252)) if np.std(rets) > 0 else 0.0001
         sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
-        ai = ai_predict_return(candles)
+
+        # TimeSeriesSplit 앙상블 + LightGBM 분류는 종목당 꽤 무거워서(유니버스 전체면
+        # 응답이 수십 초까지 걸릴 수 있음) 매 요청마다 재계산하지 않고 캐시한다.
+        cache_key = f"ai_predict:{s['symbol']}"
+        ai = await cache_get(cache_key, max_age_hours=3)
+        if ai is None:
+            # CPU 바운드(sklearn/lightgbm 학습)라 to_thread로 돌려 이벤트 루프를
+            # 막지 않고, 여러 종목 학습이 실제로 병렬화되게 한다.
+            ai = await asyncio.to_thread(ai_predict_return, candles)
+            if ai is not None:
+                await cache_set(cache_key, ai)
+
         code6 = s["symbol"].split(".")[0]
         sentiment = await cache_get(f"sentiment:{code6}", max_age_hours=72)
         batch = (batch_scores or {}).get("scores", {}).get(s["symbol"])
