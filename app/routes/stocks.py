@@ -11,7 +11,7 @@ from app.models import Portfolio, Order, BrokerSettings, CustomIndicator
 from app.lib.session import get_current_user
 from app.services.stock import (
     get_quote, get_candles, get_market_summary,
-    get_quant_indicators, QUANT_STOCKS,
+    get_quant_indicators, get_fundamentals, QUANT_STOCKS,
 )
 from app.services import auto_trade
 from app.services.quant_pipeline import backtest_custom_indicator
@@ -120,6 +120,15 @@ async def stock_search(q: str = Query(..., min_length=1)):
         return {"results": results}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"종목 검색 실패: {exc}") from exc
+
+
+@router.get("/stocks/fundamentals")
+async def stock_fundamentals(symbol: str = Query(..., description="예: 005930.KS")):
+    """PER/PBR/ROE/분기실적 등 실제 기업 펀더멘털 (Yahoo Finance quoteSummary)."""
+    data = await get_fundamentals(symbol)
+    if data.get("error"):
+        raise HTTPException(502, data["error"])
+    return data
 
 
 @router.get("/stocks/signals")

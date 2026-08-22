@@ -1,4 +1,5 @@
 """주가 데이터 서비스: Yahoo Finance API 기반."""
+import time
 import httpx
 from datetime import datetime, timezone
 from typing import Any
@@ -83,6 +84,131 @@ async def get_quote(symbol: str) -> dict:
         "currency": meta.get("currency", "KRW"),
         "market": meta.get("exchangeName"),
     }
+
+
+_yahoo_session: dict = {"cookies": None, "crumb": None, "ts": 0.0}
+_CRUMB_TTL_SEC = 1800
+
+
+async def _get_yahoo_crumb() -> tuple[dict, str] | None:
+    """quoteSummary(v10)는 crumb+쿠키가 있어야 401을 피할 수 있다.
+    fc.yahoo.com에서 쿠키를 받고 getcrumb으로 crumb을 발급받는 흐름을 30분 캐싱한다.
+    """
+    now = time.time()
+    if _yahoo_session["crumb"] and now - _yahoo_session["ts"] < _CRUMB_TTL_SEC:
+        return _yahoo_session["cookies"], _yahoo_session["crumb"]
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=HEADERS) as client:
+            await client.get("https://fc.yahoo.com")
+            resp = await client.get(
+                "https://query2.finance.yahoo.com/v1/test/getcrumb", cookies=client.cookies,
+            )
+            crumb = resp.text.strip()
+            cookies = dict(client.cookies)
+        if not crumb or "Invalid" in crumb or "<html" in crumb.lower():
+            return None
+        _yahoo_session.update({"cookies": cookies, "crumb": crumb, "ts": now})
+        return cookies, crumb
+    except Exception:
+        return None
+
+
+def _raw(mod: dict | None, key: str) -> Any:
+    """Yahoo quoteSummary 필드는 대부분 {"raw": ..., "fmt": ...} 형태."""
+    if not mod:
+        return None
+    v = mod.get(key)
+    if isinstance(v, dict):
+        return v.get("raw")
+    return v
+
+
+async def get_fundamentals(symbol: str) -> dict:
+    """Yahoo Finance quoteSummary 기반 실제 기업 펀더멘털 (PER/PBR/ROE/분기실적 등).
+
+    일부 필드(특히 재무상태표 총자산/부채 상세)는 Yahoo가 국내 상장사에 대해
+    제공하지 않는 경우가 있어 해당 값은 null로 반환한다 — 프론트엔드가 '데이터 없음'
+    으로 표시하며, 값을 지어내지 않는다.
+    """
+    cache_key = f"fundamentals:{symbol}"
+    cached = await cache_get(cache_key, max_age_hours=6)
+    if cached is not None:
+        return cached
+
+    session = await _get_yahoo_crumb()
+    modules = "price,summaryDetail,defaultKeyStatistics,financialData,incomeStatementHistoryQuarterly,balanceSheetHistory"
+    params: dict[str, Any] = {"modules": modules}
+    cookies = None
+    if session:
+        cookies, crumb = session
+        params["crumb"] = crumb
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0, headers=HEADERS, cookies=cookies) as client:
+            resp = await client.get(
+                f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}", params=params,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        result = data.get("quoteSummary", {}).get("result")
+        if not result:
+            return {"symbol": symbol, "error": "데이터 없음"}
+        r = result[0]
+    except Exception as e:
+        return {"symbol": symbol, "error": f"조회 실패: {e}"}
+
+    price_mod = r.get("price", {})
+    summary = r.get("summaryDetail", {})
+    stats = r.get("defaultKeyStatistics", {})
+    fin = r.get("financialData", {})
+
+    def _pct(mod: dict, key: str) -> float | None:
+        v = _raw(mod, key)
+        return round(v * 100, 2) if v is not None else None
+
+    def _eok(v: float | None) -> float | None:
+        """원 단위 -> 억원 단위 (기존 목업과 동일한 스케일)."""
+        return round(v / 1e8, 0) if v is not None else None
+
+    quarters, revenue, op, net = [], [], [], []
+    inc_history = list(reversed(r.get("incomeStatementHistoryQuarterly", {}).get("incomeStatementHistory", [])))
+    for q in inc_history:
+        end = q.get("endDate", {}).get("fmt", "")
+        quarters.append(f"{end[2:4]}Q{(int(end[5:7]) - 1) // 3 + 1}" if end else "")
+        revenue.append(_eok(_raw(q, "totalRevenue")))
+        op.append(_eok(_raw(q, "operatingIncome")))
+        net.append(_eok(_raw(q, "netIncome")))
+
+    bs_list = r.get("balanceSheetHistory", {}).get("balanceSheetStatements", [])
+    bs = bs_list[0] if bs_list else {}
+
+    fundamentals = {
+        "symbol": symbol,
+        "name": price_mod.get("longName") or price_mod.get("shortName") or symbol,
+        "price": _raw(price_mod, "regularMarketPrice"),
+        "chg": _pct(price_mod, "regularMarketChangePercent"),
+        "cap": _eok(_raw(price_mod, "marketCap") or _raw(summary, "marketCap")),
+        "per": _raw(summary, "trailingPE") or _raw(stats, "forwardPE"),
+        "pbr": _raw(stats, "priceToBook"),
+        "eps": _raw(stats, "trailingEps"),
+        "bps": _raw(stats, "bookValue"),
+        "roe": _pct(fin, "returnOnEquity"),
+        "roa": _pct(fin, "returnOnAssets"),
+        "debt": round(_raw(fin, "debtToEquity"), 1) if _raw(fin, "debtToEquity") is not None else None,
+        "div": _raw(summary, "dividendRate"),
+        "divYield": _pct(summary, "dividendYield"),
+        "opMargin": _pct(fin, "operatingMargins"),
+        "revenue": revenue,
+        "op": op,
+        "net": net,
+        "quarters": quarters,
+        "assets": _eok(_raw(bs, "totalAssets")),
+        "equity": _eok(_raw(bs, "totalStockholderEquity")),
+        "liabilities": _eok(_raw(bs, "totalLiab")),
+        "cash": _eok(_raw(bs, "cash")),
+    }
+    await cache_set(cache_key, fundamentals)
+    return fundamentals
 
 
 async def get_candles(symbol: str, period: str = "1y", interval: str = "1d") -> dict:
